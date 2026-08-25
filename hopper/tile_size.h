@@ -22,7 +22,17 @@ constexpr std::tuple<int, int, bool, bool> tile_size_fwd_sm90(
             } else {
                 // Switch to tile size 192 x 192 for now
                 bool const use_blockN_128 = is_causal || is_local || paged_kv_non_TMA;
+#ifdef FLASHATTENTION_SHORT_SEQ_TILES
+                // Opt-in (FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE): narrow KV tile tuned for
+                // short sequences.  On GH200, D=64 non-causal varlen: +21% at seqlen 128-256,
+                // +3% at 512, break-even near 1500, and -10% at seqlen >= 8192.  Only enable
+                // this if your workload is dominated by sequences shorter than ~1k.
+                // See docs/protein_varlen_gh200.md for the measured crossover table.
+                return use_blockN_128 ? std::tuple<int, int, bool, bool>{192, 128, true, true}
+                                      : std::tuple<int, int, bool, bool>{192, 80, true, false};
+#else
                 return {192, use_blockN_128 ? 128 : 192, use_blockN_128, true};
+#endif
             }
             // Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen
             // return {192, is_causal || is_local ? 192 : 176, true, false};

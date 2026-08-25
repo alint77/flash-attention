@@ -44,7 +44,14 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool IntraWGOverlap = std::get<3>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
+#ifdef FLASHATTENTION_SHORT_SEQ_TILES
+    // The narrow-KV short-seq tile runs more KV iterations per work tile, so it benefits from
+    // one more pipeline stage (~+1.5 TFLOP/s).  Tied to the same opt-in flag because a deeper
+    // pipeline costs shared memory for every SM90 forward config.
+    static constexpr int kStages = Arch >= 90 ? 3 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+#else
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+#endif
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;

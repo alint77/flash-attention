@@ -1,24 +1,51 @@
 # FlashAttention
 
-> ### Fork note: persistent backward scheduler for short/dispersed varlen (SM90)
->
-> This fork adds a **persistent n-block tile scheduler to the FlashAttention-3 backward
-> pass** for the non-causal varlen case on Hopper/GH200. On a ModernBERT-style workload
-> (H=16, D=64, 65536 tokens, mean seqlen ~194, lognormal σ=0.5) the main backward kernel
-> goes **0.981 → 0.859 ms (−12.5%)**, with gradients matching the stock kernel and
-> training loss bit-identical over 30 steps.
->
-> The win comes from not launching empty CTAs: `SingleTileScheduler` launches a
-> *rectangular* grid of `ceil_div(max_seqlen_k, kBlockN) × batch × heads`, and on that
-> workload **71% of those CTAs are empty tiles** that only write zeros.
->
-> **This is a dispersion win, not a short-sequence win, and it is not free.** When tiles
-> are mostly full it is a slight regression (−1.1% at 64.6% fill). It currently ships
-> behind a compile-time gate; a fill-ratio-based runtime gate is the right long-term fix.
-> Full analysis, measurements and the two bugs that make the naive port silently wrong:
-> **[docs/gh200_persistent_bwd.md](docs/gh200_persistent_bwd.md)**.
->
-> Upstream README follows.
+## FlashAttention-3 varlen, tuned for protein language model training
+
+This fork adapts the FlashAttention-3 **varlen** path (SM90 / Hopper / GH200) to the regime
+protein language models actually train in: **many short sequences packed into one pass**.
+A UniRef-style batch is ~65,536 tokens made of ~350 sequences with a **median length near 165**
+and a long tail out past 900 — nothing like the multi-thousand-token sequences upstream's
+defaults are tuned for.
+
+Two changes, both scoped to non-causal varlen with `headdim <= 64`:
+
+1. **Persistent n-block backward scheduler** (on by default in this fork). Upstream's backward
+   launches a *rectangular* grid — every sequence gets as many KV blocks as the *longest*
+   sequence in the batch — so on a protein batch **71% of the CTAs are empty tiles that only
+   write zeros**. This replaces that with a persistent scheduler over the real tiles:
+   37,744 CTAs → 132, and 17% fewer instructions executed.
+2. **Short-sequence forward tiles** (opt-in: `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE`). A narrow
+   KV tile (192×80, `IntraWGOverlap=false`) plus a deeper pipeline (`kStages=3`), which suits
+   short sequences but **regresses long ones**, hence the flag.
+
+![protein varlen benchmark](docs/assets/protein_varlen_gh200.png)
+
+| | upstream | this fork | speedup |
+|---|---|---|---|
+| forward | 0.484 ms (142 TF/s) | **0.397 ms (173 TF/s)** | **−17.9%** |
+| backward | 1.324 ms (130 TF/s) | **1.221 ms (141 TF/s)** | **−7.8%** |
+| **fwd + bwd** | **1.817 ms (132 TF/s)** | **1.615 ms (149 TF/s)** | **−11.2%** |
+
+GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean 3 seeds. Gradients match
+upstream exactly and 30 steps of pretraining give bit-identical eval loss.
+
+**Read the caveats before enabling this.** Both changes trade long-sequence throughput for
+short-sequence throughput; the forward flag costs ~10% at seqlen ≥ 8k. Measured crossover
+tables, the mechanism, and the two bugs that make the naive backward port *silently return
+wrong gradients*: **[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md)**.
+
+### Build
+
+```bash
+cd hopper
+export FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE   # optional; forward tiles for short seqs
+python setup.py install
+```
+
+---
+
+Upstream README follows.
 
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the

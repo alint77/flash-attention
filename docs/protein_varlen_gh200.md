@@ -1,4 +1,4 @@
-# A persistent backward scheduler for short, dispersed varlen attention (SM90)
+# FlashAttention-3 varlen tuning for protein language models (SM90 / GH200)
 
 This document describes a change to the FlashAttention-3 backward pass on Hopper: replacing
 the non-persistent `SingleTileScheduler` with a **persistent n-block varlen tile scheduler**
@@ -6,12 +6,98 @@ for the non-causal varlen case. It covers the motivation, the measurements, the 
 make the naive version silently wrong, and the conditions under which the change is a
 regression rather than a win.
 
-All numbers were measured on a single **GH200** (Grace-Hopper, 132 SMs, 680 W cap,
-measured 3.64 TB/s HBM, ~605 TFLOP/s bf16 GEMM) with CUDA 13 and PyTorch 2.12.
+## Summary
+
+Two changes to the FlashAttention-3 varlen path, both scoped to non-causal `headdim <= 64`:
+
+| | upstream | this fork | speedup |
+|---|---|---|---|
+| forward | 0.484 ms (142 TF/s) | **0.397 ms (173 TF/s)** | **-17.9%** |
+| backward | 1.324 ms (130 TF/s) | **1.221 ms (141 TF/s)** | **-7.8%** |
+| **fwd + bwd** | **1.817 ms (132 TF/s)** | **1.615 ms (149 TF/s)** | **-11.2%** |
+
+![protein varlen benchmark](assets/protein_varlen_gh200.png)
+
+Protein-LM regime: 65,536 tokens/pass, ~347 sequences, median length 163, mean 187, max ~900
+(lognormal, UniRef-like), H=16, D=64, bf16, non-causal. Mean of 3 seeds, 60 timed iterations
+each after 20 warmup.
+
+Hardware: a single **GH200** (Grace-Hopper, 132 SMs, 680 W enforced cap, measured 3.64 TB/s
+HBM, ~605 TFLOP/s bf16 GEMM), CUDA 13, PyTorch 2.12.
+
+Ablated, so the two changes can be judged separately:
+
+| variant | fwd | bwd | fwd+bwd |
+|---|---|---|---|
+| upstream | 0.484 ms | 1.324 ms | 1.817 ms |
+| + persistent bwd | 0.484 ms (+0.1%) | 1.219 ms (**-7.9%**) | 1.707 ms (-6.1%) |
+| + persistent bwd + short-seq fwd tiles | 0.397 ms (**-17.9%**) | 1.221 ms (-7.8%) | 1.615 ms (**-11.2%**) |
+
+The two are independent: the forward flag does not touch the backward, and vice versa.
+
+**Correctness.** Both changes produce gradients identical to the stock kernel
+(`dQ` 0.0156 / `dK` 0.0078 / `dV` 0.0078 max abs error vs per-sequence fp32 SDPA — the same
+error the stock kernel has), verified up to 1,200 tiles. 30 steps of single-GPU pretraining
+give loss identical to 4 decimal places at every step and **bit-identical eval loss**.
 
 ---
 
-## 1. Motivation
+## Part 1 — Short-sequence forward tiles (opt-in)
+
+`FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` switches the `headdim <= 64` non-causal forward from
+upstream's `{192, 192, RS=false, IntraWGOverlap=true}` to `{192, 80, RS=true,
+IntraWGOverlap=false}`, and raises the KV pipeline from `kStages=2` to `3`.
+
+A per-axis sweep at the protein regime (m=192, RS=true, overlap=false, stages=2) shows a smooth
+unimodal optimum in the KV tile width:
+
+```
+tile_n   32     48     64     80     96    112    128    160    192
+TFLOP/s  152.5  167.9  173.7  177.2  175.1  172.4  171.9  161.3  148.8
+                              ^^^^^
+```
+
+`IntraWGOverlap=false` wins everywhere (+1 to +7 TF/s), `tile_m` 192 > 128 > 64
+(175 / 168 / 143), and `kStages` 3 > 4 > 2 (~+1.5 TF/s).
+
+The mechanism is **scheduler load balance across ragged sequences**, not padding arithmetic:
+`tile_n` 64, 96 and 192 pad a median-169 sequence identically, yet differ by 25 TF/s.
+`tile_n=192` gives exactly one KV iteration and no pipelining (worst, 148.8); the optimum sits
+around three iterations. Shared-memory bank conflicts are *not* the constraint — the fastest
+config has the *most* conflicts (53.4%) and `tile_n=64` the fewest (18%) while being slower.
+
+### Why it is opt-in: the crossover
+
+This is a *tile-quantization* win and it inverts at long sequence length. D=64 non-causal,
+fixed-length varlen, 65,536 tokens per pass:
+
+| seqlen | upstream | short-seq tiles | delta |
+|---|---|---|---|
+| 128 | 97.9 TF/s | 118.9 | **+21.4%** |
+| 256 | 129.5 | 158.4 | **+22.3%** |
+| 512 | 258.0 | 268.0 | +3.9% |
+| 1024 | 316.3 | 325.0 | +2.8% |
+| 2048 | 379.7 | 375.4 | -1.1% |
+| 4096 | 430.5 | 402.9 | -6.4% |
+| 8192 | 463.4 | 418.7 | -9.6% |
+| 16384 | 445.2 | 399.1 | **-10.4%** |
+
+Break-even is near seqlen 1500. Upstream's own comment two lines below the tile table says as
+much — *"Good for long seqlen (>= 4k) but suffers from tile quantization at short seqlen"* —
+so this is not a bug in upstream's choice, it is a different operating point.
+
+`tile_size_fwd_sm90()` has no `seqlen` parameter and its result becomes *template* parameters,
+so the tile is baked per `(headdim, causal, ...)` at compile time. Gating on sequence length
+properly would need two instantiations of the kernel plus a host-side dispatch. Until then the
+flag defaults to upstream behaviour so nothing regresses silently. `kStages` is tied to the same
+flag because a deeper pipeline costs shared memory for *every* SM90 forward config, not just
+this one.
+
+---
+
+## Part 2 — Persistent backward scheduler (default on)
+
+### Motivation
 
 The target workload is masked-LM pretraining of a ModernBERT-style encoder, where sequences
 are packed varlen with a **mean length around 190 and a long tail**:
@@ -49,7 +135,7 @@ regime pays it disproportionately.
 
 ---
 
-## 2. What is actually being wasted
+### What is actually being wasted
 
 The backward's `SingleTileScheduler` launches a **rectangular grid**:
 
@@ -77,7 +163,7 @@ A persistent scheduler enumerates only the real tiles across a resident grid of 
 
 ---
 
-## 3. The change
+### The change
 
 The port is far smaller than it first appears, because most of the machinery already exists
 upstream:
@@ -91,7 +177,7 @@ upstream:
 * The `BwdNamedBarriers::KVEmpty` handshake exists, commented out, with the note:
   *"We're not currently using this bc we're not using persistent scheduler."*
 
-### 3.1 Reusing the forward's scheduler over n-blocks
+#### Reusing the forward's scheduler over n-blocks
 
 `VarlenDynamicPersistentTileScheduler`'s first template parameter is named `kBlockM`, but it is
 only ever used as `ceil_div(seqlen, ·)`. **Passing `kBlockN` makes it decompose over n-blocks** —
@@ -114,7 +200,7 @@ Barrier IDs do not collide: the scheduler uses cutlass *reserved* barriers
 (`StreamkBarrier0/1` → hardware 4, 5), while `BwdNamedBarriers` are user barriers offset by
 `ReservedNamedBarrierCount = 8` → hardware 8–15.
 
-### 3.2 The work counter
+#### The work counter
 
 The persistent scheduler's `prefetch_next_work` does
 `atomicAdd(params.tile_count_semaphore, 1)`. The backward never allocated one — the lines were
@@ -127,14 +213,14 @@ Tensor tile_count_semaphore = torch::stable::new_zeros(
 params.tile_count_semaphore = static_cast<int*>(tile_count_semaphore.data_ptr());
 ```
 
-> **Trap 1.** The build uses **`flash_api_stable.cpp`**, not `flash_api.cpp`. Patching only the
+> **Watch out.** The build uses **`flash_api_stable.cpp`**, not `flash_api.cpp`. Patching only the
 > latter compiles and links fine, then faults at runtime with
 > `Invalid __global__ atomic of size 4 bytes … Access to 0x0 is out of bounds` inside
 > `prefetch_next_work`. Compute-sanitizer names the host frame — read it.
 
 ---
 
-## 4. Trap 2: `TensorStorage` is a union
+### The trap: `TensorStorage` is a union
 
 This is the bug worth remembering, because it produces **silently wrong gradients** and passes
 compute-sanitizer cleanly.
@@ -182,7 +268,7 @@ returns before its `sync` when `m_block_max <= m_block_min`, and `store_zero()` 
 
 ---
 
-## 5. Testing: why the first round of correctness tests proved nothing
+### Testing: why the first round of correctness tests proved nothing
 
 Gradients were checked against per-sequence PyTorch SDPA. The initial tests all passed on the
 broken version, because **they never exercised persistence at all**: with fewer tiles than SMs,
@@ -219,9 +305,9 @@ End-to-end, 30 steps of single-GPU pretraining: **loss identical to 4 dp at ever
 
 ---
 
-## 6. Measurements
+### Measurements
 
-### 6.1 Main backward kernel (Nsight Compute)
+#### Main backward kernel (Nsight Compute)
 
 | metric | `SingleTileScheduler` | persistent |
 |---|---|---|
@@ -241,7 +327,7 @@ The win is **not** better per-instruction efficiency. IPC is flat and per-warp s
 marginally *worse*. The kernel simply executes 17% fewer instructions, because 71% of the CTAs
 it used to launch existed only to write zeros.
 
-### 6.2 Wall-clock, isolated benchmark
+#### Wall-clock, isolated benchmark
 
 Per fwd+bwd iteration, all FA kernels, median of alternating repeats:
 
@@ -253,7 +339,7 @@ Per fwd+bwd iteration, all FA kernels, median of alternating repeats:
 | `BwdPostprocessConvertdQ` | 0.137 | 0.137 |
 | **total** | **1.712 ms** | **1.603 ms (−6.4%)** |
 
-### 6.3 The change is a *dispersion* win, not a short-sequence win
+#### The change is a *dispersion* win, not a short-sequence win
 
 Sweeping the length distribution at constant token count (65,536) and constant `kBlockN = 128`.
 "fill" is the fraction of launched CTAs that are non-empty; time is total FA kernel time per
@@ -271,7 +357,7 @@ The benefit tracks the empty-CTA fraction almost monotonically. **At high fill t
 small regression** — the `KVEmpty` handshake serialises the producer against the epilogue of the
 previous tile, and when there are no empty CTAs to eliminate that serialisation is pure cost.
 
-### 6.4 End-to-end
+#### End-to-end
 
 Single-GPU nanoPLM pretraining, warm compile cache, step time at step 20:
 
@@ -287,7 +373,9 @@ run in fp8; the kernel-level −12.5% is the result that is actually resolved.
 
 ---
 
-## 7. Status and limitations
+---
+
+## Status and limitations
 
 * Gated at compile time to `Arch >= 90 && Varlen && !Is_causal && !Is_local && !GQA`.
   Causal keeps `SingleTileBwdLPTScheduler`; everything else keeps `SingleTileScheduler`.
@@ -300,15 +388,19 @@ run in fp8; the kernel-level −12.5% is the result that is actually resolved.
   left in place and the credit accounting handles it, but it is **not** covered by the tests
   above.
 * Deterministic mode, GQA, split-KV and paged KV are untouched and still use the stock path.
+* The forward flag (`FLASH_ATTENTION_SHORT_SEQ_TILES`) is **off by default** and regresses
+  seqlen >= 2k; see the crossover table in Part 1. It affects only `headdim <= 64` non-causal,
+  but `kStages=3` under the same flag affects every SM90 forward config's shared-memory budget.
 * Only tested for `headdim = 64`, bf16, SM90. Other head dims should work — nothing in the
   change is head-dim specific — but they have not been run.
 
-## 8. Reproducing
+## Reproducing
 
 ```bash
 # build (SM90, bf16, hdim64, varlen, fwd+bwd)
 cd hopper
 export FLASH_ATTN_CUDA_ARCHS=90
+export FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE   # optional: short-seq forward tiles
 for v in SPLIT PAGEDKV APPENDKV LOCAL SOFTCAP PACKGQA FP16 FP8 \
          HDIM96 HDIM128 HDIM192 HDIM256 HDIMDIFF64 HDIMDIFF192 SM80; do
   export FLASH_ATTENTION_DISABLE_$v=TRUE
