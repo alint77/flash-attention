@@ -22,8 +22,21 @@ Protein-LM regime: 65,536 tokens/pass, ~347 sequences, median length 163, mean 1
 (lognormal, UniRef-like), H=16, D=64, bf16, non-causal. Mean of 3 seeds, 60 timed iterations
 each after 20 warmup.
 
-Hardware: a single **GH200** (Grace-Hopper, 132 SMs, 680 W enforced cap, measured 3.64 TB/s
-HBM, ~605 TFLOP/s bf16 GEMM), CUDA 13, PyTorch 2.12.
+Hardware: a single JUPITER **GH200** (Grace-Hopper, 132 SMs, 228 KB smem/SM, 680 W enforced
+cap, measured 3.64 TB/s HBM copy, ~605 TFLOP/s achieved bf16 GEMM), CUDA 13, PyTorch 2.12.
+That is a machine balance of **~166 FLOP/byte**, against ~250 for an H100 SXM — the 680 W cap
+is a ~24% compute derate with no bandwidth penalty, leaving the part ~35% more bandwidth-rich
+per FLOP.
+
+> **The original hypothesis, and why it was wrong.** This investigation started from the
+> observation that `hopper/tile_size.h` is commented *"benchmarked on H100 SXM"*, and the guess
+> that a machine with a ~35% different compute/bandwidth ratio would want a different tile.
+> **It does not.** At seqlen 8192, 37 configurations were swept on GH200 and none beat the H100
+> table, because FA3 sits at ~97% of the achievable GEMM ceiling there — there is no roofline
+> headroom to exploit. The gains documented below are *workload-shape* effects (tile
+> quantization and empty CTAs on short ragged sequences), not hardware-balance effects, and
+> would likely reproduce on an H100. No H100 control was available, so **nothing in this
+> document is claimed as GH200-specific.**
 
 Ablated, so the two changes can be judged separately:
 
@@ -417,3 +430,17 @@ rm -f build/temp.*/instantiations/*.o build/temp.*/*.o
 rm -f build/lib.*/flash_attn_3/_C.abi3.so flash_attn_3/_C.abi3.so
 touch instantiations/*.cu *.cpp
 ```
+
+---
+
+## Disclosure
+
+The changes, benchmarks, profiling and this document were produced with
+[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** at high reasoning
+effort, on the JUPITER cluster, under the repository owner's direction and review.
+
+Every number here is from a real run on a GH200; none are estimated or extrapolated. Where a
+result is weak or inside measurement noise it is labelled as such — see the end-to-end section,
+where the effect is *not* separable from run-to-run variance. Where a hypothesis was falsified
+it is recorded as falsified rather than dropped, including the one that motivated the entire
+investigation.

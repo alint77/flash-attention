@@ -35,6 +35,36 @@ short-sequence throughput; the forward flag costs ~10% at seqlen ≥ 8k. Measure
 tables, the mechanism, and the two bugs that make the naive backward port *silently return
 wrong gradients*: **[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md)**.
 
+### Where this started: GH200 is not an H100
+
+The work began on the [JUPITER](https://www.fz-juelich.de/en/ias/jsc/jupiter) booster, whose
+nodes carry four GH200 Grace-Hopper superchips. Measured on one of them:
+
+| | JUPITER GH200 | H100 SXM |
+|---|---|---|
+| power cap | **680 W** (enforced, flat) | 900 W |
+| HBM bandwidth (achieved copy) | **3.64 TB/s** | ~3.35 TB/s |
+| bf16 GEMM (achieved) | **~605 TFLOP/s** | ~750–990 TFLOP/s |
+| **machine balance** | **~166 FLOP/byte** | **~250 FLOP/byte** |
+| SMs / smem per SM | 132 / 228 KB | 132 / 228 KB |
+
+The 680 W cap is a ~24% compute derate with no bandwidth penalty, which leaves the GH200
+roughly **35% more bandwidth-rich per FLOP** than an H100. Upstream's forward tile table in
+`hopper/tile_size.h` carries the comment *"benchmarked on H100 SXM"*. The starting hypothesis
+was that a machine with a materially different compute/bandwidth ratio should prefer a
+different tile shape.
+
+**That hypothesis was falsified, and it is worth saying so plainly.** At seqlen 8192 the H100
+table is already optimal on GH200 — 37 configurations were swept and nothing beat it — because
+FA3 sits at ~97% of the achievable GEMM ceiling there, leaving no headroom for a roofline
+argument. The wins in this fork are **not** attributable to the GH200's balance. They come from
+the *shape of the workload*: short, ragged, varlen sequences, where the costs are tile
+quantization and empty CTAs rather than the FLOP:byte ratio. They would very likely reproduce
+on an H100. **No H100 control was available**, so nothing here is claimed as GH200-specific.
+
+The hardware ratio was the question that started the investigation; the answer turned out to
+be about sequence-length distribution instead.
+
 ### Build
 
 ```bash
@@ -42,6 +72,18 @@ cd hopper
 export FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE   # optional; forward tiles for short seqs
 python setup.py install
 ```
+
+---
+
+### Disclosure
+
+This fork's changes, benchmarks, profiling and documentation were produced with
+[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** at high reasoning
+effort, working on the JUPITER cluster under my direction and review. Every performance number
+in this README and in `docs/` is from an actual run on a GH200 — nothing is estimated or
+extrapolated. Correctness claims are backed by gradient checks against per-sequence PyTorch
+SDPA and by end-to-end training runs; the specific checks and their limits are listed in
+[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md).
 
 ---
 
