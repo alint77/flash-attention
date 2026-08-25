@@ -388,6 +388,65 @@ run in fp8; the kernel-level −12.5% is the result that is actually resolved.
 
 ---
 
+## Where this fork is slower
+
+Both changes are operating-point trades. Measured against upstream on **uniform-length** varlen
+(every sequence the same length, so tile fill is 100% and there are no empty CTAs to remove),
+65,536 tokens per pass, D=64 non-causal, percent change vs upstream — negative is slower:
+
+![uniform length regression](assets/uniform_len_regression.png)
+
+| uniform seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|---|---|
+| **backward**, persistent only | **-7.2%** | -2.9% | -1.9% | -2.0% | **-7.1%** | -5.0% | -4.0% | -4.3% |
+| **forward**, flag on | +18.3% | +18.2% | +5.7% | +6.0% | -6.3% | -6.6% | -8.4% | **-9.9%** |
+| **fwd+bwd**, both on | +1.9% | +6.2% | -2.2% | -2.9% | -3.1% | -5.2% | -5.1% | **-8.2%** |
+
+Absolute forward throughput for the same sweep (TFLOP/s):
+
+| seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|---|---|
+| upstream | 100.0 | 131.5 | 256.2 | 287.6 | 381.8 | 421.6 | 449.9 | 447.5 |
+| short-seq tiles | 122.4 | 160.7 | 271.6 | 306.1 | 359.3 | 395.6 | 415.0 | 407.2 |
+
+### The backward's regression is about tile *fill*, not sequence length
+
+This is the part that is easy to get wrong. The persistent backward is **not** a
+"short sequence" optimisation — it is an "empty CTA" optimisation, and uniform-length batches
+have no empty CTAs at any length. Holding total tokens fixed and varying only the *dispersion*
+of the length distribution (total FA kernel time per iteration):
+
+| distribution | max len | tile fill | upstream | persistent | delta |
+|---|---|---|---|---|---|
+| uniform 194 | 194 | 100.0% | 1.528 ms | 1.532 ms | **-0.2%** |
+| lognormal s=0.25 | 378 | 64.6% | 1.511 ms | 1.527 ms | **-1.1%** |
+| lognormal s=0.5 (protein) | 815 | 28.7% | 1.712 ms | 1.622 ms | **+5.2%** |
+| lognormal s=0.9 | 2779 | 11.5% | 2.588 ms | 2.262 ms | **+12.6%** |
+| lognormal s=1.3 | 2376 | 18.1% | 3.132 ms | 2.897 ms | **+7.5%** |
+
+The benefit tracks the empty-CTA fraction almost monotonically. Below roughly 50% fill it wins;
+above that the `KVEmpty` handshake — which serialises the producer against the previous work
+tile's epilogue, and which the single-tile scheduler does not need — is pure overhead.
+
+The isolated uniform-length numbers above (-7.2% at seqlen 128) are a larger regression than the
+dispersion sweep's -0.2%, because the dispersion sweep measures *total* FA kernel time
+(forward + backward + preprocess + postprocess) while the table above isolates the backward.
+
+**Practical guidance:** if your dataloader length-buckets, sorts by length, or pads to a fixed
+length, tile fill will be high and you should use upstream. This fork targets packed varlen with
+a genuinely ragged length distribution, which is what protein corpora look like.
+
+### The honest fix, not implemented
+
+Both changes should be selected at runtime from the actual fill ratio, which the host already
+knows — it has `cu_seqlens` and it computes `num_blocks_n`, so `real_tiles / rectangular_grid`
+costs nothing to evaluate. A threshold near 0.5 would capture both wins and avoid both
+regressions. For the backward this is straightforward (the scheduler is chosen host-side). For
+the forward it is harder: `tile_size_fwd_sm90()` result becomes *template* parameters, so it
+needs two kernel instantiations plus a dispatch.
+
+---
+
 ## Status and limitations
 
 * Gated at compile time to `Arch >= 90 && Varlen && !Is_causal && !Is_local && !GQA`.

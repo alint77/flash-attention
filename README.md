@@ -30,10 +30,35 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean 3 seeds. Gradients match
 upstream exactly and 30 steps of pretraining give bit-identical eval loss.
 
-**Read the caveats before enabling this.** Both changes trade long-sequence throughput for
-short-sequence throughput; the forward flag costs ~10% at seqlen ≥ 8k. Measured crossover
-tables, the mechanism, and the two bugs that make the naive backward port *silently return
-wrong gradients*: **[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md)**.
+### When this fork is slower
+
+Both changes buy short-and-ragged throughput by giving up something else, and neither is a
+free win. **If your sequences are all roughly the same length, this fork is slower than
+upstream** — at every length tested.
+
+![uniform length regression](docs/assets/uniform_len_regression.png)
+
+Uniform-length varlen, 65,536 tokens/pass, D=64 non-causal, % vs upstream (negative = slower):
+
+| uniform seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|---|---|
+| backward (default) | **−7.2** | −2.9 | −1.9 | −2.0 | **−7.1** | −5.0 | −4.0 | −4.3 |
+| forward (flag on) | +18.3 | +18.2 | +5.7 | +6.0 | −6.3 | −6.6 | −8.4 | **−9.9** |
+| fwd+bwd (flag on) | +1.9 | +6.2 | −2.2 | −2.9 | −3.1 | −5.2 | −5.1 | **−8.2** |
+
+Two separate effects:
+
+* **The backward regresses whenever tile fill is high.** Uniform lengths mean the rectangular
+  grid has *no* empty CTAs, so there is nothing to eliminate and the change only pays for the
+  extra producer/epilogue handshake it needs. It wins only when lengths are *dispersed* — +7.9%
+  on a protein batch (28.7% fill), +12.6% at 11.5% fill, but −1.1% at 64.6% fill and worse at
+  100%. It is on by default here because this is a protein-LM fork; **if your batches are
+  length-bucketed or padded to a common length, use upstream.**
+* **The forward regresses past ~1.5k tokens**, which is tile quantization, and is why it is
+  behind a flag.
+
+Mechanism, full crossover tables, and the two bugs that make the naive backward port *silently
+return wrong gradients*: **[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md)**.
 
 ### Where this started: GH200 is not an H100
 
