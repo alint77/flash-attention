@@ -1,4 +1,25 @@
 # FlashAttention
+
+> ### Fork note: persistent backward scheduler for short/dispersed varlen (SM90)
+>
+> This fork adds a **persistent n-block tile scheduler to the FlashAttention-3 backward
+> pass** for the non-causal varlen case on Hopper/GH200. On a ModernBERT-style workload
+> (H=16, D=64, 65536 tokens, mean seqlen ~194, lognormal σ=0.5) the main backward kernel
+> goes **0.981 → 0.859 ms (−12.5%)**, with gradients matching the stock kernel and
+> training loss bit-identical over 30 steps.
+>
+> The win comes from not launching empty CTAs: `SingleTileScheduler` launches a
+> *rectangular* grid of `ceil_div(max_seqlen_k, kBlockN) × batch × heads`, and on that
+> workload **71% of those CTAs are empty tiles** that only write zeros.
+>
+> **This is a dispersion win, not a short-sequence win, and it is not free.** When tiles
+> are mostly full it is a slight regression (−1.1% at 64.6% fill). It currently ships
+> behind a compile-time gate; a fill-ratio-based runtime gate is the right long-term fix.
+> Full analysis, measurements and the two bugs that make the naive port silently wrong:
+> **[docs/gh200_persistent_bwd.md](docs/gh200_persistent_bwd.md)**.
+>
+> Upstream README follows.
+
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.

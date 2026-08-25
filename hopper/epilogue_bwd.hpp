@@ -220,8 +220,8 @@ struct CollectiveEpilogueBwd {
                 }
             }
             tma_store_wait<0>();
-            // // Tell warp 0 that smem_k and smem_v are ready
-            // cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+            // Tell warp 0 that smem_k and smem_v are free again (persistent scheduler).
+            cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 
         } else {
             flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
@@ -256,9 +256,9 @@ struct CollectiveEpilogueBwd {
                 gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV, tdKVcdKV, tdKVpdV, kBlockN);
             flash::copy</*Is_even_MN=*/EvenN, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
                 gmem_tiled_copy_dKV, tdKVsdK, tdKVrdK, tdKVcdKV, tdKVpdK, kBlockN);
-            // // Tell warp 0 that smem_k and smem_v are ready
-            // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
-            // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+            // Tell warp 0 that smem_k and smem_v are free again (persistent scheduler).
+            cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_k/v
+            flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
             // Construct identity layout for gdKV
             // Clear_OOB_K must be false since we don't want to write zeros to gmem
             flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(

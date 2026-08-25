@@ -93,10 +93,22 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         flash::CollectiveEpilogueBwd<TileShape_MNK, Element, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, dKV_swapAB, NumMmaWarpGroups * (Arch >= 90 ? 1 : cutlass::NumWarpsPerWarpGroup) / AtomLayoutNdKV>,
         flash::CollectiveEpilogueBwdGQA<TileShape_MNK, ElementAccum, ArchTag, CollectiveMainloop::NumMmaThreads, Varlen, Deterministic>
     >;
+    // GH200 short-varlen: persistent n-block scheduler for the non-causal varlen case.
+    // Template arg 1 is the block size used for ceil_div(seqlen, .) -> pass kBlockN so the
+    // decomposition is over n-blocks; scheduler_args already carries cu_seqlens_k/seqlen_k.
+    using SchedulerPersistentBwd = flash::VarlenDynamicPersistentTileScheduler<
+        kBlockN, kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads,
+        false /*Split*/, false /*PackGQA*/, true /*WarpSpecialized*/,
+        false /*LPT*/, false /*Sort*/, false /*Prepared*/>;
+    static constexpr bool UsePersistentBwd = (Arch >= 90) && Varlen && !Is_causal && !Is_local && !GQA;
     using Scheduler = std::conditional_t<
         Is_causal,
         flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
-        flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
+        std::conditional_t<
+            UsePersistentBwd,
+            SchedulerPersistentBwd,
+            flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>
+        >
     >;
     using AttnKernel = std::conditional_t<
         Arch >= 90,

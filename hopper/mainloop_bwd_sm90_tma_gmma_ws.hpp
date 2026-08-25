@@ -507,6 +507,12 @@ struct CollectiveMainloopBwdSm90 {
 
         int lane_predicate = cute::elect_one_sync();
 
+        // Wait for the MMA warpgroups to release the mainloop smem.  Required once the
+        // scheduler is persistent: TensorStorage is a union of the mainloop and epilogue
+        // tensors, so sdK/sdV of work tile t alias sQ/sK/sV/sdO of tile t+1.  This has to
+        // come before the Q/dO TMA, not just before the K/V TMA.
+        cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+
         if (lane_predicate) {
             pipeline_q.producer_acquire(smem_pipe_write);
             copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
@@ -514,9 +520,6 @@ struct CollectiveMainloopBwdSm90 {
             copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                  gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
         }
-
-        // // Wait for the MMA warpgroups to say that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::sync(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 
         if (lane_predicate) {
             // Copy K tile and V tile from GMEM to SMEM.
@@ -668,9 +671,8 @@ struct CollectiveMainloopBwdSm90 {
 
     CUTLASS_DEVICE void
     mma_init() {
-        // We're not currently using this bc we're not using persistent scheduler
-        // // Tell producer (warp 0) that smem_k and smem_v are ready
-        // cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
+        // Tell producer (warp 0) that smem_k and smem_v are ready (initial credit).
+        cutlass::arch::NamedBarrier::arrive(NumMmaThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
         int warp_idx_in_warpgroup = __shfl_sync(0xffffffff, (threadIdx.x / 32) % 4, 0);
         if constexpr (dQacc_use_TMA) {
             if (warp_idx_in_warpgroup == 0) {
