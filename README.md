@@ -29,7 +29,9 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean of 3 seeds. Throughput,
 so higher is better. Gradients match upstream exactly and 80 steps of pretraining give an
-identical loss curve.
+identical loss curve. End-to-end this is worth **+0.91%** of step time on a single GPU with
+fp8 off, where attention is only 7.8% of the step —
+[details and caveats](docs/protein_varlen_gh200.md#end-to-end-training).
 
 ### The two changes pull in opposite directions
 

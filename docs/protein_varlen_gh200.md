@@ -6,6 +6,16 @@ for the non-causal varlen case. It covers the motivation, the measurements, the 
 make the naive version silently wrong, and the conditions under which the change is a
 regression rather than a win.
 
+**Contents**
+
+1. [Summary](#summary)
+2. [Part 1 — Short-sequence forward tiles (opt-in)](#part-1--short-sequence-forward-tiles-opt-in)
+3. [Part 2 — Persistent backward scheduler (default on)](#part-2--persistent-backward-scheduler-default-on)
+4. [Part 3 — Operating range: when this helps and when it hurts](#part-3--operating-range-when-this-helps-and-when-it-hurts)
+5. [Status and limitations](#status-and-limitations)
+6. [Reproducing](#reproducing)
+
+
 ## Summary
 
 Two changes to the FlashAttention-3 varlen path, both scoped to non-causal `headdim <= 64`:
@@ -17,6 +27,9 @@ Two changes to the FlashAttention-3 varlen path, both scoped to non-causal `head
 | **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** |
 
 ![protein varlen benchmark](assets/protein_varlen_gh200.png)
+
+Each panel shows only the variants that can affect that stage: the persistent backward does not
+touch the forward, and the short-seq tiles do not touch the backward.
 
 Protein-LM regime: 65,536 tokens/pass, ~347 sequences, median length 163, mean 187, max ~900
 (lognormal, UniRef-like), H=16, D=64, bf16, non-causal. Mean of 3 seeds, 60 timed iterations
@@ -52,8 +65,8 @@ The two are independent: the forward flag does not touch the backward, and vice 
 
 **Correctness.** Both changes produce gradients identical to the stock kernel
 (`dQ` 0.0156 / `dK` 0.0078 / `dV` 0.0078 max abs error vs per-sequence fp32 SDPA — the same
-error the stock kernel has), verified up to 1,200 tiles. 30 steps of single-GPU pretraining
-give loss identical to 4 decimal places at every step and **bit-identical eval loss**.
+error the stock kernel has), verified up to 1,200 tiles. 80 steps of single-GPU pretraining
+give an identical loss curve — see [Part 3](#end-to-end-training).
 
 ---
 
@@ -314,9 +327,9 @@ pers   out=0.0078  dQ=0.0156  dK=0.0078  dV=0.0078
 
 (bf16 tolerances vs fp32 SDPA reference; identical to the stock kernel's own error.)
 
-End-to-end, 30 steps of single-GPU pretraining: **loss identical to 4 dp at every logged step,
-`eval_loss` bit-identical (2.9355 / 2.8995), no NaN**. `grad_norm` differs in the 5th digit
-(3.7059 vs 3.7060), as expected from a different dK/dV reduction order.
+End-to-end, 80 steps of single-GPU pretraining: **loss identical at 15 of 16 logged steps** (one
+differs by 0.0001), no NaN. `grad_norm` differs in the 5th digit, as expected from a different
+dK/dV reduction order. Timings in [Part 3](#end-to-end-training).
 
 ---
 
@@ -354,32 +367,22 @@ Per fwd+bwd iteration, all FA kernels, median of alternating repeats:
 | `BwdPostprocessConvertdQ` | 0.137 | 0.137 |
 | **total** | **1.712 ms** | **1.603 ms (1.07× faster)** |
 
-##### The change is a *dispersion* win, not a short-sequence win
+#### The change is a *dispersion* win, not a short-sequence win
 
-Superseded by the variance sweep at the top of this document, which pins the mean length and is
-measured in throughput. Summary: the backward's speedup rises monotonically with the spread of
+Superseded by the variance sweep in Part 3, which pins the mean length and is measured in
+throughput. Summary: the backward's speedup rises monotonically with the spread of
 the length distribution, from −1% at zero variance to +37% at CV 1.83, tracking the empty-CTA
 fraction.
 
 #### End-to-end
 
-Single-GPU nanoPLM pretraining, warm compile cache, step time at step 20:
-
-```
-ctrl  {340.61, 339.49} ms
-pers  {339.02, 338.52} ms      →  −0.38%
-```
-
-The persistent build is faster in both repeats, but the difference (1.28 ms) is comparable to
-the spread within the control arm alone (1.12 ms). **Read this as "no regression, plausibly a
-small win", not as a measured speedup.** Attention is a modest fraction of a step whose GEMMs
-run in fp8; the kernel-level speedup is the result that is actually resolved.
+See [Part 3](#end-to-end-training).
 
 ---
 
----
+## Part 3 — Operating range: when this helps and when it hurts
 
-## Variance sweep: separating the two mechanisms
+### Variance sweep: separating the two mechanisms
 
 The cleanest experiment for telling the two changes apart. Token budget fixed at 65,536 and the
 **arithmetic mean sequence length pinned to 200 for every point** (lognormal `mu` is set to
@@ -421,11 +424,11 @@ to hide behind.
 
 ---
 
-## Where this fork is slower
+### Where this fork is slower
 
 Both changes are operating-point trades. Measured against upstream on **uniform-length** varlen
 (every sequence the same length, so tile fill is 100% and there are no empty CTAs to remove),
-65,536 tokens per pass, D=64 non-causal, percent change vs upstream — negative is slower:
+65,536 tokens per pass, D=64 non-causal. Throughput, so higher is better:
 
 ![uniform length regression](assets/uniform_len_regression.png)
 
@@ -447,11 +450,11 @@ Absolute forward throughput for the same sweep (TFLOP/s):
 | upstream | 100.0 | 131.5 | 256.2 | 287.6 | 381.8 | 421.6 | 449.9 | 447.5 |
 | short-seq tiles | 122.4 | 160.7 | 271.6 | 306.1 | 359.3 | 395.6 | 415.0 | 407.2 |
 
-### The backward's regression is about tile *fill*, not sequence length
+#### The backward's regression is about tile *fill*, not sequence length
 
 This is the part that is easy to get wrong. The persistent backward is **not** a "short
 sequence" optimisation — it is an "empty CTA" optimisation, and uniform-length batches have no
-empty CTAs at any length. The variance sweep at the top of this document isolates exactly this:
+empty CTAs at any length. The variance sweep in Part 3 isolates exactly this:
 holding the mean length fixed at 200 and varying only the spread moves the backward from −1% to
 +37%, monotonically with tile fill.
 
@@ -459,7 +462,7 @@ holding the mean length fixed at 200 and varying only the spread moves the backw
 length, tile fill will be high and you should use upstream. This fork targets packed varlen with
 a genuinely ragged length distribution, which is what protein corpora look like.
 
-### The honest fix, not implemented
+#### The honest fix, not implemented
 
 Both changes should be selected at runtime from the actual fill ratio, which the host already
 knows — it has `cu_seqlens` and it computes `num_blocks_n`, so `real_tiles / rectangular_grid`
@@ -467,6 +470,43 @@ costs nothing to evaluate. A threshold near 0.5 would capture both wins and avoi
 regressions. For the backward this is straightforward (the scheduler is chosen host-side). For
 the forward it is harder: `tile_size_fwd_sm90()` result becomes *template* parameters, so it
 needs two kernel instantiations plus a dispatch.
+
+---
+
+### End-to-end training
+
+nanoPLM masked-LM pretraining, **single GPU, no FSDP, fp8 disabled**, 80 steps, warm compile
+cache. All three arms run **sequentially on the same node** to remove node-to-node variance,
+two repeats each, alternating.
+
+| variant | median step | mean | min | speedup |
+|---|---|---|---|---|
+| upstream | 373.18 ms | 372.95 | 371.28 | — |
+| + persistent bwd | 371.36 ms | 371.68 | 368.96 | **+0.49%** |
+| + persistent bwd + short-seq fwd tiles | **369.78 ms** | 369.81 | 367.70 | **+0.91%** |
+
+Loss is identical at 15 of the 16 logged steps (one differs by 0.0001, consistent with a
+different dK/dV reduction order). The effect is small but *resolved*: the spread within an arm
+is ~0.3 ms against a 3.4 ms gap between arms.
+
+**Why under 1%, and why that is the expected answer.** Attention is only **7.8%** of a step in
+this configuration (16 layers x 1.82 ms of a 373 ms step), so a 12.5% attention speedup cannot
+buy more than ~0.9% end to end. Predicting the step time from the isolated kernel numbers:
+
+| variant | predicted | measured | error |
+|---|---|---|---|
+| + persistent bwd | +0.47% | +0.49% | 0.02 pp |
+| + both | +0.87% | **+0.91%** | 0.05 pp |
+
+Agreement to within 0.05 percentage points says the kernel measurements are real and that
+nothing else in the step regressed to absorb the gain.
+
+**Do not read this as the end-to-end figure for a real training run.** It is one GPU with no
+FSDP communication to overlap against, and fp8 is off, which slows the GEMMs and therefore
+*shrinks* attention's share of the step. With fp8 enabled, or at a scale where attention is a
+larger fraction, the same kernel speedup is worth proportionally more. A multi-GPU measurement
+has not been made.
+
 
 ---
 
