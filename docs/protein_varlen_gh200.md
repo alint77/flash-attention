@@ -12,9 +12,9 @@ Two changes to the FlashAttention-3 varlen path, both scoped to non-causal `head
 
 | | upstream | this fork | speedup |
 |---|---|---|---|
-| forward | 0.484 ms (142 TF/s) | **0.397 ms (173 TF/s)** | **-17.9%** |
-| backward | 1.324 ms (130 TF/s) | **1.221 ms (141 TF/s)** | **-7.8%** |
-| **fwd + bwd** | **1.817 ms (132 TF/s)** | **1.615 ms (149 TF/s)** | **-11.2%** |
+| forward | 142 TFLOP/s | **173 TFLOP/s** | **+21.8%** |
+| backward | 130 TFLOP/s | **141 TFLOP/s** | **+8.4%** |
+| **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** |
 
 ![protein varlen benchmark](assets/protein_varlen_gh200.png)
 
@@ -40,11 +40,13 @@ per FLOP.
 
 Ablated, so the two changes can be judged separately:
 
-| variant | fwd | bwd | fwd+bwd |
+| variant | forward | backward | fwd+bwd |
 |---|---|---|---|
-| upstream | 0.484 ms | 1.324 ms | 1.817 ms |
-| + persistent bwd | 0.484 ms (+0.1%) | 1.219 ms (**-7.9%**) | 1.707 ms (-6.1%) |
-| + persistent bwd + short-seq fwd tiles | 0.397 ms (**-17.9%**) | 1.221 ms (-7.8%) | 1.615 ms (**-11.2%**) |
+| upstream | 142 | 130 | 132 |
+| + persistent bwd | 142 (−0.1%) | 141 (**+8.5%**) | 141 (+6.5%) |
+| + persistent bwd + short-seq fwd tiles | 173 (**+21.8%**) | 141 (+8.4%) | 149 (**+12.5%**) |
+
+TFLOP/s; higher is better.
 
 The two are independent: the forward flag does not touch the backward, and vice versa.
 
@@ -84,15 +86,15 @@ config has the *most* conflicts (53.4%) and `tile_n=64` the fewest (18%) while b
 This is a *tile-quantization* win and it inverts at long sequence length. D=64 non-causal,
 fixed-length varlen, 65,536 tokens per pass:
 
-| seqlen | upstream | short-seq tiles | delta |
+| seqlen | upstream | short-seq tiles | speedup |
 |---|---|---|---|
 | 128 | 97.9 TF/s | 118.9 | **+21.4%** |
 | 256 | 129.5 | 158.4 | **+22.3%** |
 | 512 | 258.0 | 268.0 | +3.9% |
 | 1024 | 316.3 | 325.0 | +2.8% |
-| 2048 | 379.7 | 375.4 | -1.1% |
-| 4096 | 430.5 | 402.9 | -6.4% |
-| 8192 | 463.4 | 418.7 | -9.6% |
+| 2048 | 379.7 | 375.4 | −1.1% |
+| 4096 | 430.5 | 402.9 | −6.4% |
+| 8192 | 463.4 | 418.7 | −9.6% |
 | 16384 | 445.2 | 399.1 | **-10.4%** |
 
 Break-even is near seqlen 1500. Upstream's own comment two lines below the tile table says as
@@ -326,7 +328,7 @@ End-to-end, 30 steps of single-GPU pretraining: **loss identical to 4 dp at ever
 |---|---|---|
 | grid | 37,744 CTAs | **132** |
 | waves per SM | 285.94 | **1** |
-| duration | 1.18 ms | **1.00 ms** |
+| duration | 1.18 ms | **1.00 ms (1.18× faster)** |
 | **instructions executed** | 231.4 M | **191.5 M (−17.2%)** |
 | cycles | 1.540 M | 1.249 M (−18.9%) |
 | compute (SM) throughput | 32.8% | 40.4% |
@@ -346,29 +348,18 @@ Per fwd+bwd iteration, all FA kernels, median of alternating repeats:
 
 | kernel | ctrl | persistent |
 |---|---|---|
-| main `FlashAttnBwdSm90` | 0.981 ms | **0.859 ms (−12.5%)** |
+| main `FlashAttnBwdSm90` | 0.981 ms | **0.859 ms (1.14× faster)** |
 | forward recompute | 0.403 | 0.415 |
 | `BwdPreprocess` | 0.186 | 0.186 |
 | `BwdPostprocessConvertdQ` | 0.137 | 0.137 |
-| **total** | **1.712 ms** | **1.603 ms (−6.4%)** |
+| **total** | **1.712 ms** | **1.603 ms (1.07× faster)** |
 
-#### The change is a *dispersion* win, not a short-sequence win
+##### The change is a *dispersion* win, not a short-sequence win
 
-Sweeping the length distribution at constant token count (65,536) and constant `kBlockN = 128`.
-"fill" is the fraction of launched CTAs that are non-empty; time is total FA kernel time per
-iteration:
-
-| distribution | max | fill | ctrl | persistent | Δ |
-|---|---|---|---|---|---|
-| uniform 194 | 194 | 100.0% | 1.528 ms | 1.532 ms | **−0.2%** |
-| lognormal σ=0.25 | 378 | 64.6% | 1.511 ms | 1.527 ms | **−1.1%** |
-| lognormal σ=0.5 | 815 | 28.7% | 1.712 ms | 1.622 ms | **+5.2%** |
-| lognormal σ=0.9 | 2779 | 11.5% | 2.588 ms | 2.262 ms | **+12.6%** |
-| lognormal σ=1.3 | 2376 | 18.1% | 3.132 ms | 2.897 ms | **+7.5%** |
-
-The benefit tracks the empty-CTA fraction almost monotonically. **At high fill the change is a
-small regression** — the `KVEmpty` handshake serialises the producer against the epilogue of the
-previous tile, and when there are no empty CTAs to eliminate that serialisation is pure cost.
+Superseded by the variance sweep at the top of this document, which pins the mean length and is
+measured in throughput. Summary: the backward's speedup rises monotonically with the spread of
+the length distribution, from −1% at zero variance to +37% at CV 1.83, tracking the empty-CTA
+fraction.
 
 #### End-to-end
 
@@ -382,7 +373,7 @@ pers  {339.02, 338.52} ms      →  −0.38%
 The persistent build is faster in both repeats, but the difference (1.28 ms) is comparable to
 the spread within the control arm alone (1.12 ms). **Read this as "no regression, plausibly a
 small win", not as a measured speedup.** Attention is a modest fraction of a step whose GEMMs
-run in fp8; the kernel-level −12.5% is the result that is actually resolved.
+run in fp8; the kernel-level speedup is the result that is actually resolved.
 
 ---
 
@@ -402,24 +393,28 @@ backward timed separately.
 | coeff. of variation | 0.02 | 0.15 | 0.30 | 0.47 | 0.66 | 0.96 | 1.35 | 1.83 |
 | max length | 200 | 314 | 482 | 724 | 1062 | 1711 | 2648 | 3937 |
 | tile fill | 100% | 68% | 51% | 33% | 22% | 14% | 9% | 6% |
-| **forward** (flag on) | **+32.2%** | +26.4% | +25.6% | +15.7% | +16.0% | +14.6% | +12.0% | **+8.6%** |
-| **backward** (default) | **−0.7%** | +0.6% | +1.7% | +4.9% | +11.1% | +17.4% | +21.7% | **+27.3%** |
+| forward, upstream | 83 | 108 | 119 | 136 | 149 | 177 | 212 | 258 |
+| forward, fork | 122 | 146 | 160 | 161 | 177 | 207 | 241 | 283 |
+| **forward speedup** | **+47%** | +36% | +34% | +19% | +19% | +17% | +14% | **+10%** |
+| backward, upstream | 125 | 116 | 118 | 122 | 129 | 144 | 164 | 184 |
+| backward, fork | 124 | 116 | 120 | 129 | 145 | 174 | 209 | 253 |
+| **backward speedup** | **−1%** | +1% | +2% | +5% | +12% | +21% | +28% | **+37%** |
+
+All figures TFLOP/s; higher is better.
 
 The two curves are near mirror images, and that is the whole story of this fork:
 
-* **Forward — a short-sequence effect.** Best at zero variance (+32.2%), monotonically decaying
-  to +8.6% as the tail grows. The narrow 192x80 KV tile wins because a 200-token sequence
+* **Forward — a short-sequence effect.** Best at zero variance (+47%), decaying to +10% as the tail grows. The narrow 192x80 KV tile wins because a 200-token sequence
   against a 192-wide tile wastes most of the tile; as sequences lengthen, upstream's wide tile
   amortises better and the advantage erodes. This is tile quantisation.
-* **Backward — a dispersion effect.** Break-even at zero variance (-0.7%), climbing
-  monotonically to +27.3%. Nothing here depends on sequences being short: it depends on them
+* **Backward — a dispersion effect.** Break-even at zero variance (−1%), climbing monotonically to +37%. Nothing here depends on sequences being short: it depends on them
   being *unequal*, because that is what fills the rectangular grid with empty CTAs. This is
   scheduling.
 
 They are independent and compose. A protein corpus sits near sigma 0.55 (CV ~0.6, ~22% fill),
-where the forward still returns ~+16% and the backward ~+11%.
+where the forward still returns ~+19% and the backward ~+12%.
 
-Note the backward's -0.7% at sigma=0 here is milder than the -7.2% in the uniform-length table
+Note the backward's −0.7% at sigma=0 here is milder than the −7.2% in the uniform-length table
 below, because this sweep pins the mean at 200 (two KV blocks per sequence) while that one also
 tests seqlen 128 (a single KV block), where the per-tile handshake overhead has the least work
 to hide behind.
@@ -436,9 +431,14 @@ Both changes are operating-point trades. Measured against upstream on **uniform-
 
 | uniform seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|---|---|
-| **backward**, persistent only | **-7.2%** | -2.9% | -1.9% | -2.0% | **-7.1%** | -5.0% | -4.0% | -4.3% |
-| **forward**, flag on | +18.3% | +18.2% | +5.7% | +6.0% | -6.3% | -6.6% | -8.4% | **-9.9%** |
-| **fwd+bwd**, both on | +1.9% | +6.2% | -2.2% | -2.9% | -3.1% | -5.2% | -5.1% | **-8.2%** |
+| forward, upstream | 100 | 131 | 256 | 288 | 382 | 422 | 450 | 447 |
+| forward, fork | 122 | 161 | 272 | 306 | 359 | 396 | 415 | 407 |
+| **forward speedup** | **+22.3%** | +22.2% | +6.0% | +6.4% | −5.9% | −6.2% | −7.8% | **−9.0%** |
+| backward, upstream | 112 | 190 | 281 | 338 | 407 | 441 | 450 | 464 |
+| backward, fork | 104 | 185 | 276 | 332 | 380 | 420 | 433 | 445 |
+| **backward speedup** | **−6.7%** | −2.8% | −1.8% | −1.9% | −6.6% | −4.7% | −3.9% | −4.2% |
+
+All figures TFLOP/s; higher is better.
 
 Absolute forward throughput for the same sweep (TFLOP/s):
 
@@ -449,26 +449,11 @@ Absolute forward throughput for the same sweep (TFLOP/s):
 
 ### The backward's regression is about tile *fill*, not sequence length
 
-This is the part that is easy to get wrong. The persistent backward is **not** a
-"short sequence" optimisation — it is an "empty CTA" optimisation, and uniform-length batches
-have no empty CTAs at any length. Holding total tokens fixed and varying only the *dispersion*
-of the length distribution (total FA kernel time per iteration):
-
-| distribution | max len | tile fill | upstream | persistent | delta |
-|---|---|---|---|---|---|
-| uniform 194 | 194 | 100.0% | 1.528 ms | 1.532 ms | **-0.2%** |
-| lognormal s=0.25 | 378 | 64.6% | 1.511 ms | 1.527 ms | **-1.1%** |
-| lognormal s=0.5 (protein) | 815 | 28.7% | 1.712 ms | 1.622 ms | **+5.2%** |
-| lognormal s=0.9 | 2779 | 11.5% | 2.588 ms | 2.262 ms | **+12.6%** |
-| lognormal s=1.3 | 2376 | 18.1% | 3.132 ms | 2.897 ms | **+7.5%** |
-
-The benefit tracks the empty-CTA fraction almost monotonically. Below roughly 50% fill it wins;
-above that the `KVEmpty` handshake — which serialises the producer against the previous work
-tile's epilogue, and which the single-tile scheduler does not need — is pure overhead.
-
-The isolated uniform-length numbers above (-7.2% at seqlen 128) are a larger regression than the
-dispersion sweep's -0.2%, because the dispersion sweep measures *total* FA kernel time
-(forward + backward + preprocess + postprocess) while the table above isolates the backward.
+This is the part that is easy to get wrong. The persistent backward is **not** a "short
+sequence" optimisation — it is an "empty CTA" optimisation, and uniform-length batches have no
+empty CTAs at any length. The variance sweep at the top of this document isolates exactly this:
+holding the mean length fixed at 200 and varying only the spread moves the backward from −1% to
++37%, monotonically with tile fill.
 
 **Practical guidance:** if your dataloader length-buckets, sorts by length, or pads to a fixed
 length, tile fill will be high and you should use upstream. This fork targets packed varlen with

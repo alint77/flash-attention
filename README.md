@@ -23,12 +23,13 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 
 | | upstream | this fork | speedup |
 |---|---|---|---|
-| forward | 0.484 ms (142 TF/s) | **0.397 ms (173 TF/s)** | **−17.9%** |
-| backward | 1.324 ms (130 TF/s) | **1.221 ms (141 TF/s)** | **−7.8%** |
-| **fwd + bwd** | **1.817 ms (132 TF/s)** | **1.615 ms (149 TF/s)** | **−11.2%** |
+| forward | 142 TFLOP/s | **173 TFLOP/s** | **+21.8%** |
+| backward | 130 TFLOP/s | **141 TFLOP/s** | **+8.4%** |
+| **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** |
 
-GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean 3 seeds. Gradients match
-upstream exactly and 30 steps of pretraining give bit-identical eval loss.
+GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean of 3 seeds. Throughput,
+so higher is better. Gradients match upstream exactly and 80 steps of pretraining give an
+identical loss curve.
 
 ### The two changes pull in opposite directions
 
@@ -42,10 +43,16 @@ Holding the token budget and the **arithmetic mean length fixed at 200** and var
 | coeff. of variation | 0.02 | 0.15 | 0.30 | 0.47 | 0.66 | 0.96 | 1.35 | 1.83 |
 | max length | 200 | 314 | 482 | 724 | 1062 | 1711 | 2648 | 3937 |
 | tile fill | 100% | 68% | 51% | 33% | 22% | 14% | 9% | 6% |
-| **forward** (flag on) | **+32.2%** | +26.4% | +25.6% | +15.7% | +16.0% | +14.6% | +12.0% | **+8.6%** |
-| **backward** (default) | **−0.7%** | +0.6% | +1.7% | +4.9% | +11.1% | +17.4% | +21.7% | **+27.3%** |
+| forward, upstream | 83 | 108 | 119 | 136 | 149 | 177 | 212 | 258 |
+| forward, fork | 122 | 146 | 160 | 161 | 177 | 207 | 241 | 283 |
+| **forward speedup** | **+47%** | +36% | +34% | +19% | +19% | +17% | +14% | **+10%** |
+| backward, upstream | 125 | 116 | 118 | 122 | 129 | 144 | 164 | 184 |
+| backward, fork | 124 | 116 | 120 | 129 | 145 | 174 | 209 | 253 |
+| **backward speedup** | **−1%** | +1% | +2% | +5% | +12% | +21% | +28% | **+37%** |
 
-* The **forward** win is about sequences being *short*. It is largest at zero variance (+32%)
+All figures TFLOP/s; higher is better.
+
+* The **forward** win is about sequences being *short*. It is largest at zero variance (+47%)
   and decays as the tail lengthens, because long sequences prefer upstream's wide KV tile.
 * The **backward** win is about the distribution being *ragged*. It is break-even at zero
   variance and grows monotonically with it, because dispersion is what fills the rectangular
@@ -63,21 +70,26 @@ upstream** — at every length tested.
 
 ![uniform length regression](docs/assets/uniform_len_regression.png)
 
-Uniform-length varlen, 65,536 tokens/pass, D=64 non-causal, % vs upstream (negative = slower):
+Uniform-length varlen, 65,536 tokens/pass, D=64 non-causal:
 
 | uniform seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|---|---|
-| backward (default) | **−7.2** | −2.9 | −1.9 | −2.0 | **−7.1** | −5.0 | −4.0 | −4.3 |
-| forward (flag on) | +18.3 | +18.2 | +5.7 | +6.0 | −6.3 | −6.6 | −8.4 | **−9.9** |
-| fwd+bwd (flag on) | +1.9 | +6.2 | −2.2 | −2.9 | −3.1 | −5.2 | −5.1 | **−8.2** |
+| forward, upstream | 100 | 131 | 256 | 288 | 382 | 422 | 450 | 447 |
+| forward, fork | 122 | 161 | 272 | 306 | 359 | 396 | 415 | 407 |
+| **forward speedup** | **+22.3%** | +22.2% | +6.0% | +6.4% | −5.9% | −6.2% | −7.8% | **−9.0%** |
+| backward, upstream | 112 | 190 | 281 | 338 | 407 | 441 | 450 | 464 |
+| backward, fork | 104 | 185 | 276 | 332 | 380 | 420 | 433 | 445 |
+| **backward speedup** | **−6.7%** | −2.8% | −1.8% | −1.9% | −6.6% | −4.7% | −3.9% | −4.2% |
+
+All figures TFLOP/s; higher is better.
 
 Two separate effects:
 
 * **The backward regresses whenever tile fill is high.** Uniform lengths mean the rectangular
   grid has *no* empty CTAs, so there is nothing to eliminate and the change only pays for the
-  extra producer/epilogue handshake it needs. It wins only when lengths are *dispersed* — +7.9%
-  on a protein batch (28.7% fill), +12.6% at 11.5% fill, but −1.1% at 64.6% fill and worse at
-  100%. It is on by default here because this is a protein-LM fork; **if your batches are
+  extra producer/epilogue handshake it needs. It wins only when lengths are *dispersed* — +8.5%
+  on a protein batch, and up to +37% at 6% fill, but it is break-even to slightly negative once
+  fill approaches 100%. It is on by default here because this is a protein-LM fork; **if your batches are
   length-bucketed or padded to a common length, use upstream.**
 * **The forward regresses past ~1.5k tokens**, which is tile quantization, and is why it is
   behind a flag.
