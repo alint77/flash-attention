@@ -30,6 +30,31 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean 3 seeds. Gradients match
 upstream exactly and 30 steps of pretraining give bit-identical eval loss.
 
+### The two changes pull in opposite directions
+
+Holding the token budget and the **arithmetic mean length fixed at 200** and varying only the
+*spread* of the length distribution separates the two mechanisms cleanly:
+
+![variance sweep](docs/assets/variance_sweep.png)
+
+| lognormal σ | 0.00 | 0.15 | 0.30 | 0.45 | 0.60 | 0.80 | 1.00 | 1.20 |
+|---|---|---|---|---|---|---|---|---|
+| coeff. of variation | 0.02 | 0.15 | 0.30 | 0.47 | 0.66 | 0.96 | 1.35 | 1.83 |
+| max length | 200 | 314 | 482 | 724 | 1062 | 1711 | 2648 | 3937 |
+| tile fill | 100% | 68% | 51% | 33% | 22% | 14% | 9% | 6% |
+| **forward** (flag on) | **+32.2%** | +26.4% | +25.6% | +15.7% | +16.0% | +14.6% | +12.0% | **+8.6%** |
+| **backward** (default) | **−0.7%** | +0.6% | +1.7% | +4.9% | +11.1% | +17.4% | +21.7% | **+27.3%** |
+
+* The **forward** win is about sequences being *short*. It is largest at zero variance (+32%)
+  and decays as the tail lengthens, because long sequences prefer upstream's wide KV tile.
+* The **backward** win is about the distribution being *ragged*. It is break-even at zero
+  variance and grows monotonically with it, because dispersion is what fills the rectangular
+  grid with empty CTAs.
+
+A protein corpus (σ ≈ 0.55, CV ≈ 0.6) sits where both are positive, which is why the fork
+combines them. Neither mechanism has anything to do with the other, and either can be used
+without the other.
+
 ### When this fork is slower
 
 Both changes buy short-and-ragged throughput by giving up something else, and neither is a

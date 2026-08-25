@@ -388,6 +388,44 @@ run in fp8; the kernel-level −12.5% is the result that is actually resolved.
 
 ---
 
+## Variance sweep: separating the two mechanisms
+
+The cleanest experiment for telling the two changes apart. Token budget fixed at 65,536 and the
+**arithmetic mean sequence length pinned to 200 for every point** (lognormal `mu` is set to
+`log(200) - sigma^2/2`, so only the *spread* changes, never the mean). Two seeds, forward and
+backward timed separately.
+
+![variance sweep](assets/variance_sweep.png)
+
+| lognormal σ | 0.00 | 0.15 | 0.30 | 0.45 | 0.60 | 0.80 | 1.00 | 1.20 |
+|---|---|---|---|---|---|---|---|---|
+| coeff. of variation | 0.02 | 0.15 | 0.30 | 0.47 | 0.66 | 0.96 | 1.35 | 1.83 |
+| max length | 200 | 314 | 482 | 724 | 1062 | 1711 | 2648 | 3937 |
+| tile fill | 100% | 68% | 51% | 33% | 22% | 14% | 9% | 6% |
+| **forward** (flag on) | **+32.2%** | +26.4% | +25.6% | +15.7% | +16.0% | +14.6% | +12.0% | **+8.6%** |
+| **backward** (default) | **−0.7%** | +0.6% | +1.7% | +4.9% | +11.1% | +17.4% | +21.7% | **+27.3%** |
+
+The two curves are near mirror images, and that is the whole story of this fork:
+
+* **Forward — a short-sequence effect.** Best at zero variance (+32.2%), monotonically decaying
+  to +8.6% as the tail grows. The narrow 192x80 KV tile wins because a 200-token sequence
+  against a 192-wide tile wastes most of the tile; as sequences lengthen, upstream's wide tile
+  amortises better and the advantage erodes. This is tile quantisation.
+* **Backward — a dispersion effect.** Break-even at zero variance (-0.7%), climbing
+  monotonically to +27.3%. Nothing here depends on sequences being short: it depends on them
+  being *unequal*, because that is what fills the rectangular grid with empty CTAs. This is
+  scheduling.
+
+They are independent and compose. A protein corpus sits near sigma 0.55 (CV ~0.6, ~22% fill),
+where the forward still returns ~+16% and the backward ~+11%.
+
+Note the backward's -0.7% at sigma=0 here is milder than the -7.2% in the uniform-length table
+below, because this sweep pins the mean at 200 (two KV blocks per sequence) while that one also
+tests seqlen 128 (a single KV block), where the per-tile handshake overhead has the least work
+to hide behind.
+
+---
+
 ## Where this fork is slower
 
 Both changes are operating-point trades. Measured against upstream on **uniform-length** varlen
