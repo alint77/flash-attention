@@ -100,7 +100,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         kBlockN, kBlockM, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::NumProducerThreads,
         false /*Split*/, false /*PackGQA*/, true /*WarpSpecialized*/,
         false /*LPT*/, false /*Sort*/, false /*Prepared*/>;
-    static constexpr bool UsePersistentBwd = (Arch >= 90) && Varlen && !Is_causal && !Is_local && !GQA;
+    // Deterministic mode serializes dQ accumulation through dq_semaphore, which assumes a
+    // particular order of n_blocks per (batch, head).  The persistent scheduler hands tiles
+    // out in a different order and that interaction is untested, so exclude it.
+    static constexpr bool UsePersistentBwd = (Arch >= 90) && Varlen && !Is_causal && !Is_local && !GQA && !Deterministic;
     using Scheduler = std::conditional_t<
         Is_causal,
         flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,

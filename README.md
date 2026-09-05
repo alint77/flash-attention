@@ -21,11 +21,15 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 
 ![protein varlen benchmark](docs/assets/protein_varlen_gh200.png)
 
-| | upstream | this fork | speedup |
-|---|---|---|---|
-| forward | 142 TFLOP/s | **173 TFLOP/s** | **+21.8%** |
-| backward | 130 TFLOP/s | **141 TFLOP/s** | **+8.4%** |
-| **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** |
+| | upstream | this fork | speedup | in a default build? |
+|---|---|---|---|---|
+| forward | 142 TFLOP/s | **173 TFLOP/s** | **+21.8%** | no - needs `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` |
+| backward | 130 TFLOP/s | **141 TFLOP/s** | **+8.4%** | yes |
+| **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** | forward half needs the flag |
+
+**A default build gives you the backward change only** (+8.4% here, and -2% to -7% on uniform
+sequence lengths - see the regression table below).  The forward number, and therefore the
+combined +12.5%, requires the opt-in flag.
 
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean of 3 seeds. Throughput,
 so higher is better. Gradients match upstream exactly and 80 steps of pretraining give an

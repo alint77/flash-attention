@@ -46,9 +46,26 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr int kNWarps = std::get<2>(kBlockMN_kNWarps_Stages_RS);
 #ifdef FLASHATTENTION_SHORT_SEQ_TILES
     // The narrow-KV short-seq tile runs more KV iterations per work tile, so it benefits from
-    // one more pipeline stage (~+1.5 TFLOP/s).  Tied to the same opt-in flag because a deeper
-    // pipeline costs shared memory for every SM90 forward config.
-    static constexpr int kStages = Arch >= 90 ? 3 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    // one more pipeline stage (~+1.5 TFLOP/s).  The narrow tile is only selected when
+    // headdim <= 64 AND headdim_v is neither 256 nor 512 (see tile_size.h), and that is
+    // exactly the set of configs with the smem headroom for a 3rd stage.  Measured
+    // SharedStorageSize on SM90 bf16 against the 232,448 B cudaFuncAttributeMaxDynamic-
+    // SharedMemorySize limit (sharedMemPerBlockOptin on GH200/H100):
+    //     D    dv     kStages=3    kStages=2
+    //     64    64      125,952       93,184
+    //     64   256      268,288 (X)  206,848
+    //     64   512      306,176 (X)  232,448
+    //     96    96      259,584 (X)  204,288
+    //    128   128      232,448       166,912
+    //    192   192      310,272 (X)  224,256
+    //    256   256      314,368 (X)  232,448
+    // Every row marked (X) exceeds the limit, so an unconditional kStages=3 makes
+    // cudaFuncSetAttribute fail at launch with "invalid argument".  It compiles fine - the
+    // size is only checked at runtime - which is why this needed upstream's test suite to
+    // surface.  Note headdim_v needs its own guard: D=64 with dv=256/512 keeps kHeadDim at
+    // 64 but selects a different (wider) tile.  D=128 happens to land exactly on the limit,
+    // but it keeps the default tile and gains nothing from the extra stage.
+    static constexpr int kStages = Arch >= 90 ? (kHeadDim <= 64 && kHeadDimV <= 64 ? 3 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
 #else
     static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
 #endif
