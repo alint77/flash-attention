@@ -1531,7 +1531,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.dv_rounded = head_size_v_rounded;
 
     // Persistent bwd scheduler needs a zeroed work counter.
-    at::Tensor tile_count_semaphore = torch::zeros({1}, opts.dtype(torch::kInt32));
+    at::Tensor tile_count_semaphore = torch::zeros({1 + 2 * batch_size}, opts.dtype(torch::kInt32));
     params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
     at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));

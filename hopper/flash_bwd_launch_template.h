@@ -24,18 +24,29 @@
 
 using namespace cute;
 
+static __global__ void partition_backward_lengths(int const* cu, int* fast, int* rest, int batch) {
+    int b=blockIdx.x*blockDim.x+threadIdx.x;
+    if(b<batch) {
+        int len=cu[b+1]-cu[b];
+        bool small=len>128 && len<=256;
+        fast[b]=small?len:0;
+        rest[b]=small?0:len;
+    }
+}
+
 template <int Arch, int kHeadDim, int kBlockM, int kBlockN, typename Element,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool Deterministic, bool GQA,
           int Stages_dO=2, int Stages_dS_or_QSm80=2,
           bool SdP_swapAB=true, bool dKV_swapAB=false, bool dQ_swapAB=false,
           int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
           bool V_in_regs=false>
-void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, bool all_direct_dq = false, bool skip_preprocess = false) {
     static_assert(!(Is_causal && Is_local), "Is_causal and Is_local cannot be true at the same time.");
     using ElementAccum = float;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
-    int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * kBlockM, kBlockM);
+    constexpr int QPad = kHeadDim == 64 && kBlockM == 32 && kBlockN == 256 ? 128 : kBlockM;
+    int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * QPad, QPad);
     int const total_k_padded_rounded = cute::round_up(params.total_k + params.b * kBlockN, kBlockN);
     bool const is_varlen_q = params.cu_seqlens_q;
     bool const is_varlen_k = params.cu_seqlens_k;
@@ -46,8 +57,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? params.b : 1;
 
+    bool const direct_dq = Arch >= 90 && kHeadDim == 64 && Varlen && !Is_causal && !Is_local && !Has_softcap && !Deterministic && !GQA
+        && params.cu_seqlens_q && params.cu_seqlens_q == params.cu_seqlens_k
+        && params.seqused_q == params.seqused_k;
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
-    using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
+    using PreprocessKernel = flash::FlashAttnBwdPreprocess<cute::Shape<Int<QPad>, Int<kHeadDim>>, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
     typename PreprocessKernel::Arguments preprocess_args {
         static_cast<Element const*>(params.o_ptr),
         {seqlen_q, params.dv, params.h, batch_q},  // shape_O
@@ -67,12 +81,13 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.b,
         params.dq_semaphore,
         params.cu_seqlens_q,
-        params.seqused_q
+        all_direct_dq ? nullptr : params.seqused_q,
+        direct_dq ? kBlockN : 0
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
-    dim3 grid_m(num_m_block, params.h, params.b);
-    CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
+    dim3 grid_m(cute::ceil_div(params.seqlen_q, QPad), params.h, params.b);
+    if (!skip_preprocess) CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
@@ -148,6 +163,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.cu_seqlens_k,
         params.seqused_q, params.seqused_k
     };
+    if constexpr (Arch >= 90) {
+        mainloop_args.ptr_dQ = direct_dq ? static_cast<Element*>(params.dq_ptr) : nullptr;
+        mainloop_args.stride_dQ = {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride};
+    }
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<typename CollectiveEpilogue::Element*>(!GQA ? params.dk_ptr : params.dk_accum_ptr),
@@ -237,6 +256,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
     }
 
+    if (all_direct_dq) return;
+
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
@@ -251,7 +272,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.dq_row_stride, _1{}, params.dq_head_stride, params.dq_batch_stride},  // stride_dQ
         params.scale_softmax,
         params.cu_seqlens_q,
-        params.seqused_q
+        params.seqused_q,
+        direct_dq ? kBlockN : 0
     };
     typename PostprocessKernel::Params postprocess_params = PostprocessKernel::to_underlying_arguments(postprocess_args);
     int num_m_block_postprocess = cute::ceil_div(params.seqlen_q, get<0>(TileShape_MK{}));
@@ -325,6 +347,23 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
+    if constexpr (Arch >= 90 && !Has_softcap) {
+        if (!params.is_causal && !params.is_local && !params.deterministic && params.h==params.h_k
+            && params.cu_seqlens_q && params.cu_seqlens_q==params.cu_seqlens_k
+            && !params.seqused_q && !params.seqused_k && params.b>0) {
+            int* fast=params.tile_count_semaphore+1;
+            int* rest=fast+params.b;
+            partition_backward_lengths<<<cute::ceil_div(params.b,128),128,0,stream>>>(params.cu_seqlens_q,fast,rest,params.b);
+            CHECK_CUDA(cudaGetLastError());
+            params.seqused_q=fast;params.seqused_k=fast;
+            run_flash_bwd<Arch,64,32,256,T,false,false,false,true,false,false,2,2,true,false,true,2,1,2,2,false>(params,stream,true);
+            CHECK_CUDA(cudaMemsetAsync(params.tile_count_semaphore,0,sizeof(int),stream));
+            params.seqused_q=rest;params.seqused_k=rest;
+            run_flash_bwd<Arch,64,128,128,T,false,false,false,true,false,false,2,2,true,false,false,2,1,2,2,false>(params,stream,false,true);
+            params.seqused_q=nullptr;params.seqused_k=nullptr;
+            return;
+        }
+    }
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
             if constexpr (Is_causal && Has_softcap) {

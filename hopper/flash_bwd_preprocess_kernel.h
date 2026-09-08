@@ -87,6 +87,7 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int skip_dq_short = 0;
     };
 
     // Kernel entry point API
@@ -110,6 +111,7 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int skip_dq_short = 0;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -135,7 +137,8 @@ public:
             args.num_batch,
             args.dq_semaphore,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.skip_dq_short
         };
     }
 
@@ -228,7 +231,7 @@ public:
             gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
         }
 
-        if constexpr (Clear_dQaccum) {
+        if (Clear_dQaccum && seqlen_o > params.skip_dq_short) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
             Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;

@@ -60,7 +60,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, kBlockM>;
+    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, (kHeadDim == 64 && kBlockM == 32 && kBlockN == 256) ? 128 : kBlockM>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
@@ -320,6 +320,8 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        Element* ptr_dQ = nullptr;
+        StrideQKV stride_dQ{};
     };
 
     // Device side kernel params
@@ -350,6 +352,8 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        Element* ptr_dQ = nullptr;
+        StrideQKV stride_dQ{};
     };
 
     static Params
@@ -406,7 +410,7 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k, args.ptr_dQ, args.stride_dQ};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -614,6 +618,8 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
             if (m_block_max <= m_block_min) { return; }
         }
+
+        if (params.ptr_dQ && seqlen_info.seqlen_k <= kBlockN) { return; }
 
         Tensor sdQ = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()), SmemLayoutdQaccum{});
         static constexpr int dQ_TMA_num_bytes = CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
@@ -950,7 +956,22 @@ struct CollectiveMainloopBwdSm90 {
                     Tensor tdKrdS_cur = tdKrdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dKV, tdKrdS_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
                 }
-                if constexpr (dQacc_use_TMA) {
+                if (params.ptr_dQ && seqlen_info.seqlen_k <= kBlockN) {
+                    // This CTA owns every KV contribution for these Q rows.
+                    auto thread_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+                    Tensor cdQ = make_identity_tensor(select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
+                    Tensor coords = thread_mma_dQ.partition_C(cdQ);
+                    #pragma unroll
+                    for (int i = 0; i < size(tdQrdQ); ++i) {
+                        int row = m_block * kBlockM + get<!dQ_swapAB ? 0 : 1>(coords(i));
+                        int col = get<!dQ_swapAB ? 1 : 0>(coords(i));
+                        if (row < seqlen_info.seqlen_q && col < get<1>(params.shape_Q)) {
+                            int64_t offset = int64_t(seqlen_info.offset_q + row) * get<0>(params.stride_dQ)
+                                + int64_t(get<1>(block_coord)) * get<2>(params.stride_dQ) + col;
+                            params.ptr_dQ[offset] = Element(tdQrdQ(i) * params.softmax_scale);
+                        }
+                    }
+                } else if constexpr (dQacc_use_TMA) {
                     int const warp_group_idx = flash::canonical_warp_group_idx_nosync() - 1;
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warp_group_idx /*id*/);  // sdQ full, to be written to gmem
                     Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);

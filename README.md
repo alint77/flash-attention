@@ -8,14 +8,19 @@ A UniRef-style batch is ~65,536 tokens made of ~350 sequences with a **median le
 and a long tail out past 900 — nothing like the multi-thousand-token sequences upstream's
 defaults are tuned for.
 
-Two changes, both scoped to non-causal varlen with `headdim <= 64`:
+Three changes, all scoped to non-causal varlen with `headdim <= 64`:
 
-1. **Persistent n-block backward scheduler** (on by default in this fork). Upstream's backward
-   launches a *rectangular* grid — every sequence gets as many KV blocks as the *longest*
-   sequence in the batch — so on a protein batch **71% of the CTAs are empty tiles that only
-   write zeros**. This replaces that with a persistent scheduler over the real tiles:
-   37,744 CTAs → 132, and 17% fewer instructions executed.
-2. **Short-sequence forward tiles** (opt-in: `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE`). A narrow
+1. **Persistent n-block backward scheduler** (default on). Upstream's backward launches a
+   *rectangular* grid — every sequence gets as many KV blocks as the *longest* sequence in
+   the batch — so on a protein batch **71% of the CTAs are empty tiles that only write
+   zeros**. A persistent scheduler walks the real tiles instead: 37,744 CTAs → 132, and 17%
+   fewer instructions executed.
+2. **Direct dQ stores for short sequences** (default on). When one CTA owns a sequence's
+   entire KV range, its dQ tile is already final — so it writes bf16 straight from registers
+   and skips the FP32 accumulator clear, the atomic reduction, and the postprocess conversion
+   pass entirely. On a protein batch that removes **a third of the preprocess and half of the
+   postprocess**.
+3. **Short-sequence forward tiles** (opt-in: `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE`). A narrow
    KV tile (192×80, `IntraWGOverlap=false`) plus a deeper pipeline (`kStages=3`), which suits
    short sequences but **regresses long ones**, hence the flag.
 
@@ -23,24 +28,28 @@ Two changes, both scoped to non-causal varlen with `headdim <= 64`:
 
 | | upstream | this fork | speedup | in a default build? |
 |---|---|---|---|---|
-| forward | 142 TFLOP/s | **173 TFLOP/s** | **+21.8%** | no - needs `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` |
-| backward | 130 TFLOP/s | **141 TFLOP/s** | **+8.4%** | yes |
-| **fwd + bwd** | **132 TFLOP/s** | **149 TFLOP/s** | **+12.5%** | forward half needs the flag |
+| forward | 149 TFLOP/s | **184 TFLOP/s** | **+23.4%** | no - needs `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` |
+| backward | 131 TFLOP/s | **164 TFLOP/s** | **+24.9%** | yes |
+| **fwd + bwd** | **137 TFLOP/s** | **172 TFLOP/s** | **+25.4%** | forward half needs the flag |
 
-**A default build gives you the backward change only** (+8.4% here, and -2% to -7% on uniform
-sequence lengths - see the regression table below).  The forward number, and therefore the
-combined +12.5%, requires the opt-in flag.
+**A default build gives you the two backward changes** — worth **+24.9%** on the backward and
+**+17.6%** on fwd+bwd here. The forward number, and the remaining step up to +25.4% combined,
+requires the opt-in flag.
 
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean of 3 seeds. Throughput,
-so higher is better. Gradients match upstream exactly and 80 steps of pretraining give an
-identical loss curve. End-to-end this is worth **+0.91%** of step time on a single GPU with
-fp8 off, where attention is only 7.8% of the step —
+so higher is better. Gradients match upstream, and upstream's own test suite
+(`hopper/test_flash_attn.py`) passes — 1584 varlen and 720 non-varlen cases across
+headdim 64/96/128/192/256.
+
+**These are attention-kernel numbers, not training-step numbers.** Attention was ~7.8% of a
+step in the one end-to-end run measured here, so expect the step-time effect to be small and
+to depend heavily on how much of your model is attention —
 [details and caveats](docs/protein_varlen_gh200.md#end-to-end-training).
 
-### The two changes pull in opposite directions
+### Forward needs short sequences; backward does not
 
 Holding the token budget and the **arithmetic mean length fixed at 200** and varying only the
-*spread* of the length distribution separates the two mechanisms cleanly:
+*spread* of the length distribution separates the mechanisms cleanly:
 
 ![variance sweep](docs/assets/variance_sweep.png)
 
@@ -49,30 +58,28 @@ Holding the token budget and the **arithmetic mean length fixed at 200** and var
 | coeff. of variation | 0.02 | 0.15 | 0.30 | 0.47 | 0.66 | 0.96 | 1.35 | 1.83 |
 | max length | 200 | 314 | 482 | 724 | 1062 | 1711 | 2648 | 3937 |
 | tile fill | 100% | 68% | 51% | 33% | 22% | 14% | 9% | 6% |
-| forward, upstream | 83 | 108 | 119 | 136 | 149 | 177 | 212 | 258 |
-| forward, fork | 122 | 146 | 160 | 161 | 177 | 207 | 241 | 283 |
-| **forward speedup** | **+47%** | +36% | +34% | +19% | +19% | +17% | +14% | **+10%** |
-| backward, upstream | 125 | 116 | 118 | 122 | 129 | 144 | 164 | 184 |
-| backward, fork | 124 | 116 | 120 | 129 | 145 | 174 | 209 | 253 |
-| **backward speedup** | **−1%** | +1% | +2% | +5% | +12% | +21% | +28% | **+37%** |
+| forward, upstream | 84 | 106 | 125 | 137 | 152 | 182 | 224 | 271 |
+| forward, fork | 125 | 153 | 164 | 177 | 190 | 213 | 255 | 290 |
+| **forward speedup** | **+49%** | +44% | +32% | +30% | +25% | +17% | +14% | **+7%** |
+| backward, upstream | 125 | 116 | 120 | 124 | 131 | 145 | 166 | 186 |
+| backward, fork | 159 | 154 | 152 | 157 | 168 | 192 | 227 | 266 |
+| **backward speedup** | **+28%** | +33% | +27% | +27% | +28% | +33% | +37% | **+43%** |
 
 All figures TFLOP/s; higher is better.
 
-* The **forward** win is about sequences being *short*. It is largest at zero variance (+47%)
-  and decays as the tail lengthens, because long sequences prefer upstream's wide KV tile.
-* The **backward** win is about the distribution being *ragged*. It is break-even at zero
-  variance and grows monotonically with it, because dispersion is what fills the rectangular
-  grid with empty CTAs.
+* The **forward** win is about sequences being *short*. Largest at zero variance (+49%), it
+  decays as the tail lengthens, because long sequences prefer upstream's wide KV tile.
+* The **backward** wins across the whole range, because its two mechanisms cover different
+  parts of it. Direct dQ stores need sequences *short* (mean 200 keeps most of them under the
+  ownership threshold at every σ); the persistent scheduler needs them *ragged*, which is why
+  the curve turns back up past σ ≈ 0.45 as empty CTAs appear.
 
-A protein corpus (σ ≈ 0.55, CV ≈ 0.6) sits where both are positive, which is why the fork
-combines them. Neither mechanism has anything to do with the other, and either can be used
-without the other.
+A protein corpus (σ ≈ 0.55, CV ≈ 0.6) sits where all three are positive.
 
 ### When this fork is slower
 
-Both changes buy short-and-ragged throughput by giving up something else, and neither is a
-free win. **If your sequences are all roughly the same length, this fork is slower than
-upstream** — at every length tested.
+Both mechanisms buy short-sequence throughput by giving up something else. **Past roughly 1k
+tokens per sequence this fork is slower than upstream.**
 
 ![uniform length regression](docs/assets/uniform_len_regression.png)
 
@@ -80,23 +87,21 @@ Uniform-length varlen, 65,536 tokens/pass, D=64 non-causal:
 
 | uniform seqlen | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|---|---|
-| forward, upstream | 100 | 131 | 256 | 288 | 382 | 422 | 450 | 447 |
-| forward, fork | 122 | 161 | 272 | 306 | 359 | 396 | 415 | 407 |
-| **forward speedup** | **+22.3%** | +22.2% | +6.0% | +6.4% | −5.9% | −6.2% | −7.8% | **−9.0%** |
-| backward, upstream | 112 | 190 | 281 | 338 | 407 | 441 | 450 | 464 |
-| backward, fork | 104 | 185 | 276 | 332 | 380 | 420 | 433 | 445 |
-| **backward speedup** | **−6.7%** | −2.8% | −1.8% | −1.9% | −6.6% | −4.7% | −3.9% | −4.2% |
+| forward, upstream | 102 | 134 | 259 | 273 | 385 | 412 | 442 | 444 |
+| forward, fork | 126 | 165 | 280 | 307 | 355 | 395 | 411 | 402 |
+| **forward speedup** | **+22.9%** | +22.9% | +8.2% | +12.6% | −7.9% | −4.1% | −7.1% | **−9.5%** |
+| backward, upstream | 113 | 191 | 265 | 346 | 411 | 443 | 454 | 465 |
+| backward, fork | 125 | 217 | 274 | 345 | 396 | 429 | 442 | 452 |
+| **backward speedup** | **+10.6%** | +13.6% | +3.3% | −0.4% | −3.6% | −3.1% | −2.5% | **−2.8%** |
 
 All figures TFLOP/s; higher is better.
 
 Two separate effects:
 
-* **The backward regresses whenever tile fill is high.** Uniform lengths mean the rectangular
-  grid has *no* empty CTAs, so there is nothing to eliminate and the change only pays for the
-  extra producer/epilogue handshake it needs. It wins only when lengths are *dispersed* — +8.5%
-  on a protein batch, and up to +37% at 6% fill, but it is break-even to slightly negative once
-  fill approaches 100%. It is on by default here because this is a protein-LM fork; **if your batches are
-  length-bucketed or padded to a common length, use upstream.**
+* **The backward crosses over near 1k.** Below it, sequences fit inside one CTA's KV range and
+  the direct dQ store pays for itself. Above it, no sequence qualifies, uniform lengths leave
+  the rectangular grid with no empty CTAs to remove either, and all that is left is the
+  scheduler's extra producer/epilogue handshake — a flat ~3%.
 * **The forward regresses past ~1.5k tokens**, which is tile quantization, and is why it is
   behind a flag.
 
@@ -161,7 +166,7 @@ This is a fork of [Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash
 Installation instructions, the full feature matrix, supported architectures and the
 FlashAttention-4 / CuTeDSL documentation all live upstream — see the
 [upstream README](https://github.com/Dao-AILab/flash-attention/blob/main/README.md).
-Everything here other than the two changes described above is upstream's work, under
+Everything here other than the three changes described above is upstream's work, under
 upstream's [LICENSE](LICENSE).
 
 If you use FlashAttention, please cite the original papers:

@@ -118,6 +118,7 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int skip_dq_short = 0;
     };
 
     // Kernel entry point API
@@ -131,6 +132,7 @@ public:
         float const softmax_scale;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        int skip_dq_short = 0;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -146,7 +148,8 @@ public:
             args.stride_dQ,
             args.softmax_scale,
             args.cu_seqlens,
-            args.seqused
+            args.seqused,
+            args.skip_dq_short
         };
     }
 
@@ -169,7 +172,7 @@ public:
 
         flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
         bool const is_varlen = params.cu_seqlens;
-        if (is_varlen && m_block * kBlockM >= seqlen_info.seqlen) { return; }
+        if (is_varlen && (m_block * kBlockM >= seqlen_info.seqlen || seqlen_info.seqlen <= params.skip_dq_short)) { return; }
 
         // Step 1: load dQaccum from gmem to smem
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),

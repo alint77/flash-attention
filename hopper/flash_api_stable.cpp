@@ -1606,7 +1606,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     params.dv_rounded = head_size_v_rounded;
 
     // Persistent bwd scheduler needs a zeroed work counter.
-    Tensor tile_count_semaphore = torch::stable::new_zeros(q, {1}, std::make_optional(torch::headeronly::ScalarType::Int));
+    Tensor tile_count_semaphore = torch::stable::new_zeros(q, {1 + 2 * batch_size}, std::make_optional(torch::headeronly::ScalarType::Int));
     params.tile_count_semaphore = static_cast<int*>(tile_count_semaphore.data_ptr());
     // Will be zero'ed out in the backward preprocess kernel
     Tensor dq_semaphore = torch::stable::new_empty(q, {(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, std::make_optional(torch::headeronly::ScalarType::Int));
