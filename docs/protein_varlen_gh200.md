@@ -528,44 +528,39 @@ implemented here.
 
 ### End-to-end training
 
-> **This measurement predates the direct dQ stores (Part 2b).** It covers the persistent
-> scheduler and the forward flag only, when the combined attention gain was +12.5% rather than
-> +25.4%. The step-time numbers below are therefore a floor, not the current figure. The
-> reasoning in it — attention is a small share of the step, so the end-to-end effect is
-> under 1% — is unchanged and is the part worth reading.
+nanoPLM masked-LM pretraining, **4 GPUs, FSDP, fp8 disabled**, 80 steps, warm compile cache.
+All three arms run sequentially on the same node, two repeats each, alternating. Step time is
+the median of steps 15-75 (excluding warmup and the final eval/checkpoint step).
 
-nanoPLM masked-LM pretraining, **single GPU, no FSDP, fp8 disabled**, 80 steps, warm compile
-cache. All three arms run **sequentially on the same node** to remove node-to-node variance,
-two repeats each, alternating.
-
-| variant | median step | mean | min | speedup |
+| variant | rep 1 | rep 2 | mean | speedup |
 |---|---|---|---|---|
-| upstream | 373.18 ms | 372.95 | 371.28 | — |
-| + persistent bwd | 371.36 ms | 371.68 | 368.96 | **+0.49%** |
-| + persistent bwd + short-seq fwd tiles | **369.78 ms** | 369.81 | 367.70 | **+0.91%** |
+| upstream | 376.18 ms | 375.13 ms | **375.65 ms** | — |
+| + backward changes (default build) | 370.60 | 371.61 | **371.11 ms** | **+1.21%** |
+| + both (with forward flag) | 369.92 | 369.22 | **369.57 ms** | **+1.62%** |
 
-Loss is identical at 15 of the 16 logged steps (one differs by 0.0001, consistent with a
-different dK/dV reduction order). The effect is small but *resolved*: the spread within an arm
-is ~0.3 ms against a 3.4 ms gap between arms.
+Upstream's full range across both repeats (373.80–377.56 ms) does not overlap either fork
+arm, so the gain is resolved well clear of run-to-run noise. The forward flag's extra +0.4%
+over the default build *does* overlap and should not be treated as separable here.
 
-**Why under 1%, and why that is the expected answer.** Attention is only **7.8%** of a step in
-this configuration (16 layers x 1.82 ms of a 373 ms step), so the 12.5% attention speedup measured at the time could not
-buy more than ~0.9% end to end. Predicting the step time from the isolated kernel numbers:
+Loss is identical to four decimals in all six runs (2.7064 at step 80 in every arm).
 
-| variant | predicted | measured | error |
-|---|---|---|---|
-| + persistent bwd | +0.47% | +0.49% | 0.02 pp |
-| + both | +0.87% | **+0.91%** | 0.05 pp |
+**Why ~1.6%, and why that is the expected answer.** Attention is only **7.8%** of a step in
+this configuration, so even a large attention win is bounded. Predicting step time from the
+isolated kernel numbers:
+
+| variant | attention gain | predicted | measured | error |
+|---|---|---|---|---|
+| + backward changes | +24.9% bwd | +1.16% | **+1.21%** | 0.05 pp |
+| + both | +25.4% fwd+bwd | +1.58% | **+1.62%** | 0.04 pp |
 
 Agreement to within 0.05 percentage points says the kernel measurements are real and that
-nothing else in the step regressed to absorb the gain.
+nothing else in the step regressed to absorb the gain. It also sets expectations: **if
+attention is a small share of your step, a large attention speedup is still a small training
+speedup.** The kernel work is worth doing; it is not worth overselling.
 
-**Do not read this as the end-to-end figure for a real training run.** It is one GPU with no
-FSDP communication to overlap against, and fp8 is off, which slows the GEMMs and therefore
-*shrinks* attention's share of the step. With fp8 enabled, or at a scale where attention is a
-larger fraction, the same kernel speedup is worth proportionally more. A multi-GPU measurement
-has not been made.
-
+For reference, the earlier single-GPU measurement of this same config — before the direct dQ
+stores, when the combined attention gain was +12.5% — gave +0.49% (backward only) and +0.91%
+(both), also predicted to within 0.05 pp.
 
 ---
 

@@ -41,10 +41,10 @@ so higher is better. Gradients match upstream, and upstream's own test suite
 (`hopper/test_flash_attn.py`) passes — 1584 varlen and 720 non-varlen cases across
 headdim 64/96/128/192/256.
 
-**These are attention-kernel numbers, not training-step numbers.** Attention was ~7.8% of a
-step in the one end-to-end run measured here, so expect the step-time effect to be small and
-to depend heavily on how much of your model is attention —
-[details and caveats](docs/protein_varlen_gh200.md#end-to-end-training).
+**These are attention-kernel numbers.** End to end, on 4 GPUs with FSDP, they are worth
+**+1.21%** of step time for a default build and **+1.62%** with the forward flag — because
+attention is only 7.8% of a step in this model. Loss is unchanged to four decimals
+[(details)](docs/protein_varlen_gh200.md#end-to-end-training).
 
 ### Forward needs short sequences; backward does not
 
