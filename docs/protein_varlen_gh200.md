@@ -536,22 +536,22 @@ the median of steps 15-75 (excluding warmup and the final eval/checkpoint step).
 |---|---|---|---|---|
 | upstream | 376.18 ms | 375.13 ms | **375.65 ms** | — |
 | + backward changes (default build) | 370.60 | 371.61 | **371.11 ms** | **+1.21%** |
-| + both (with forward flag) | 369.92 | 369.22 | **369.57 ms** | **+1.62%** |
+| + both (with forward flag) | 369.92 | 370.02 | **369.97 ms** | **+1.51%** |
 
 Upstream's full range across both repeats (373.80–377.56 ms) does not overlap either fork
-arm, so the gain is resolved well clear of run-to-run noise. The forward flag's extra +0.4%
+arm, so the gain is resolved well clear of run-to-run noise. The forward flag's extra ~0.3%
 over the default build *does* overlap and should not be treated as separable here.
 
 Loss is identical to four decimals in all six runs (2.7064 at step 80 in every arm).
 
-**Why ~1.6%, and why that is the expected answer.** Attention is only **7.8%** of a step in
+**Why ~1.5%, and why that is the expected answer.** Attention is only **7.8%** of a step in
 this configuration, so even a large attention win is bounded. Predicting step time from the
 isolated kernel numbers:
 
 | variant | attention gain | predicted | measured | error |
 |---|---|---|---|---|
 | + backward changes | +24.9% bwd | +1.16% | **+1.21%** | 0.05 pp |
-| + both | +25.4% fwd+bwd | +1.58% | **+1.62%** | 0.04 pp |
+| + both | +25.4% fwd+bwd | +1.58% | **+1.51%** | 0.07 pp |
 
 Agreement to within 0.05 percentage points says the kernel measurements are real and that
 nothing else in the step regressed to absorb the gain. It also sets expectations: **if

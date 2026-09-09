@@ -42,7 +42,7 @@ so higher is better. Gradients match upstream, and upstream's own test suite
 headdim 64/96/128/192/256.
 
 **These are attention-kernel numbers.** End to end, on 4 GPUs with FSDP, they are worth
-**+1.21%** of step time for a default build and **+1.62%** with the forward flag — because
+**+1.21%** of step time for a default build and **+1.51%** with the forward flag — because
 attention is only 7.8% of a step in this model. Loss is unchanged to four decimals
 [(details)](docs/protein_varlen_gh200.md#end-to-end-training).
 
