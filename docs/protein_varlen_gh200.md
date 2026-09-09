@@ -495,11 +495,14 @@ All figures TFLOP/s; higher is better.
 
 #### The backward's crossover is near 1k
 
-Uniform lengths are the worst case for the scheduler — 100% tile fill, no empty CTAs to
-remove — so this table isolates the direct dQ store. Below ~1k a sequence fits inside one
-CTA's KV range, the dQ tile is final, and skipping the FP32 clear / reduce / convert passes
-is worth +11% to +14%. Above ~1k nothing qualifies, and what remains is the scheduler's extra
-producer/epilogue handshake: a flat ~3%.
+Uniform lengths give the scheduler no empty CTAs to remove, but this table still compares
+the combined backward changes against upstream; it is not an isolated direct-dQ ablation.
+The direct-store cutoff is **256 tokens**: sequences up to 128 fit in one N128 KV tile,
+and sequences from 129 to 256 fit in one N256 tile. At the 128 and 256 points, the combined
+fork gains +11% to +14%. Sequences longer than 256 retain FP32 accumulation and conversion,
+including those at 512 and 1024. The measured crossover near 1k is a property of the combined
+implementation, not an ownership threshold. On long uniform batches, the table shows
+roughly 3% lower backward throughput.
 
 **Practical guidance:** if your sequences are long *and* uniform, use upstream. This fork
 targets packed varlen with short, genuinely ragged sequences, which is what protein corpora
@@ -507,12 +510,19 @@ look like.
 
 #### The honest fix, not implemented
 
-Both changes should be selected at runtime from the actual fill ratio, which the host already
-knows — it has `cu_seqlens` and it computes `num_blocks_n`, so `real_tiles / rectangular_grid`
-costs nothing to evaluate. A threshold near 0.5 would capture both wins and avoid both
-regressions. For the backward this is straightforward (the scheduler is chosen host-side). For
-the forward it is harder: `tile_size_fwd_sm90()` result becomes *template* parameters, so it
-needs two kernel instantiations plus a dispatch.
+Runtime dispatch could use the actual tile-fill ratio and sequence-length distribution, but
+the current host API does not have those statistics for free. `cu_seqlens` points to GPU
+memory. The host knows the maximum-length rectangular grid size; counting real tiles requires
+the per-sequence lengths. A host-side decision would need metadata supplied by the caller or
+a device computation followed by a transfer and synchronization. A device-side dispatch would
+need its own implementation and overhead measurement.
+
+Fill ratio could help select the persistent scheduler, while the short-sequence fraction and
+length distribution also matter for direct dQ stores and forward tiles. A threshold near 0.5
+is an unvalidated candidate, not a demonstrated way to capture every win or avoid every
+regression. Selecting alternative forward tiles also requires both kernel instantiations,
+because `tile_size_fwd_sm90()` supplies template parameters. None of this dispatch is
+implemented here.
 
 ---
 
@@ -563,10 +573,11 @@ has not been made.
 
 * Gated at compile time to `Arch >= 90 && Varlen && !Is_causal && !Is_local && !GQA`.
   Causal keeps `SingleTileBwdLPTScheduler`; everything else keeps `SingleTileScheduler`.
-* **The gate is wrong in principle.** The benefit depends on the *runtime* fill ratio, which the
-  host already knows (it has `cu_seqlens` and computes `num_blocks_n`). A runtime switch on
-  something like `real_tiles / rectangular_grid < ~0.5` would capture the win without the
-  high-fill regression. That is the obvious next step and is not implemented here.
+* **The gate does not adapt to workload shape.** Runtime tile-fill and length statistics could
+  guide dispatch, but `cu_seqlens` is GPU-resident and the host does not already know the real
+  tile count. Obtaining that metadata and selecting kernels has costs that must be measured.
+  A fill threshold near 0.5 remains unvalidated; fill alone also does not capture the benefit
+  of direct dQ stores on short uniform sequences. Adaptive dispatch is not implemented here.
 * The empty-tile path under the persistent scheduler is nearly unreachable by construction
   (per-batch block counts are exact), so `store_zero()` is effectively dead code there. It is
   left in place and the credit accounting handles it, but it is **not** covered by the tests

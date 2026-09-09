@@ -98,10 +98,12 @@ All figures TFLOP/s; higher is better.
 
 Two separate effects:
 
-* **The backward crosses over near 1k.** Below it, sequences fit inside one CTA's KV range and
-  the direct dQ store pays for itself. Above it, no sequence qualifies, uniform lengths leave
-  the rectangular grid with no empty CTAs to remove either, and all that is left is the
-  scheduler's extra producer/epilogue handshake — a flat ~3%.
+* **The measured backward crossover is near 1k; the direct-dQ cutoff is 256 tokens.**
+  Sequences up to 128 use one N128 KV tile; sequences from 129 to 256 use one N256 tile.
+  Longer sequences retain FP32 accumulation and conversion, including those at 512 and 1024.
+  The crossover describes the combined fork versus upstream, not the direct-store gate.
+  On long uniform batches, no sequence qualifies and there are no empty CTAs to remove;
+  the table shows roughly 3% lower backward throughput.
 * **The forward regresses past ~1.5k tokens**, which is tile quantization, and is why it is
   behind a flag.
 
