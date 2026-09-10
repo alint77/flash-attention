@@ -1,0 +1,150 @@
+{
+  "aggregation": "Median step time in milliseconds over steps 20 through 75 of each 80-step run.",
+  "sources": "e2eswa/e2e_*.log and e2eswa/rev_e2e_*.log; execution order from swa_*.out and swarev_*.out.",
+  "runs": [
+    {
+      "arm": "base",
+      "position": 1,
+      "job": "fwdorder",
+      "dt_ms": 373.54
+    },
+    {
+      "arm": "fwdonly",
+      "position": 2,
+      "job": "fwdorder",
+      "dt_ms": 372.16
+    },
+    {
+      "arm": "bwdonly",
+      "position": 3,
+      "job": "fwdorder",
+      "dt_ms": 369.87
+    },
+    {
+      "arm": "both",
+      "position": 4,
+      "job": "fwdorder",
+      "dt_ms": 367.35
+    },
+    {
+      "arm": "ctlF_base",
+      "position": 5,
+      "job": "fwdorder",
+      "dt_ms": 371.885
+    },
+    {
+      "arm": "ctlF_both",
+      "position": 6,
+      "job": "fwdorder",
+      "dt_ms": 373.755
+    },
+    {
+      "arm": "base",
+      "position": 7,
+      "job": "fwdorder",
+      "dt_ms": 372.71
+    },
+    {
+      "arm": "fwdonly",
+      "position": 8,
+      "job": "fwdorder",
+      "dt_ms": 372.78
+    },
+    {
+      "arm": "bwdonly",
+      "position": 9,
+      "job": "fwdorder",
+      "dt_ms": 369.015
+    },
+    {
+      "arm": "both",
+      "position": 10,
+      "job": "fwdorder",
+      "dt_ms": 367.14
+    },
+    {
+      "arm": "ctlF_base",
+      "position": 11,
+      "job": "fwdorder",
+      "dt_ms": 372.71
+    },
+    {
+      "arm": "ctlF_both",
+      "position": 12,
+      "job": "fwdorder",
+      "dt_ms": 372.27
+    },
+    {
+      "arm": "ctlF_both",
+      "position": 1,
+      "job": "revorder",
+      "dt_ms": 369.765
+    },
+    {
+      "arm": "ctlF_base",
+      "position": 2,
+      "job": "revorder",
+      "dt_ms": 365.61
+    },
+    {
+      "arm": "both",
+      "position": 3,
+      "job": "revorder",
+      "dt_ms": 361.7
+    },
+    {
+      "arm": "bwdonly",
+      "position": 4,
+      "job": "revorder",
+      "dt_ms": 362.715
+    },
+    {
+      "arm": "fwdonly",
+      "position": 5,
+      "job": "revorder",
+      "dt_ms": 365.27
+    },
+    {
+      "arm": "base",
+      "position": 6,
+      "job": "revorder",
+      "dt_ms": 366.955
+    },
+    {
+      "arm": "ctlF_both",
+      "position": 7,
+      "job": "revorder",
+      "dt_ms": 367.715
+    },
+    {
+      "arm": "ctlF_base",
+      "position": 8,
+      "job": "revorder",
+      "dt_ms": 367.32
+    },
+    {
+      "arm": "both",
+      "position": 9,
+      "job": "revorder",
+      "dt_ms": 362.79
+    },
+    {
+      "arm": "bwdonly",
+      "position": 10,
+      "job": "revorder",
+      "dt_ms": 363.605
+    },
+    {
+      "arm": "fwdonly",
+      "position": 11,
+      "job": "revorder",
+      "dt_ms": 366.335
+    },
+    {
+      "arm": "base",
+      "position": 12,
+      "job": "revorder",
+      "dt_ms": 367.175
+    }
+  ]
+}

@@ -8,7 +8,8 @@ A UniRef-style batch is ~65,536 tokens made of ~350 sequences with a **median le
 and a long tail out past 900 — nothing like the multi-thousand-token sequences upstream's
 defaults are tuned for.
 
-Five changes, all scoped to varlen with `headdim <= 64`. Three for ordinary (global) attention:
+Five changes to varlen attention, tuned and benchmarked at `headdim = 64`.
+Three for ordinary (global) attention:
 
 1. **Persistent n-block backward scheduler** (default on). Upstream's backward launches a
    *rectangular* grid — every sequence gets as many KV blocks as the *longest* sequence in
@@ -26,9 +27,9 @@ Five changes, all scoped to varlen with `headdim <= 64`. Three for ordinary (glo
 
 and two for **sliding-window (local) attention**, which every change above used to skip:
 
-4. **A 64×64 forward tile for narrow windows** (default on). Upstream serves local layers from
-   the same 192×128 tile it uses for global attention, where most of each KV tile is masked out
-   and discarded. Matching the tile to the window is necessary but not sufficient — see below.
+4. **A 64×64 forward tile for narrow windows** (default on). Upstream uses a 192×128 tile for
+   local D=64 layers, where narrow windows mask out much of each KV tile. Matching the tile
+   to the window is necessary but not sufficient — see below.
 5. **The backward path extended to local attention** (default on). The persistent scheduler, the
    length partition and the direct dQ stores were all gated off for `is_local`.
 
@@ -45,9 +46,9 @@ and two for **sliding-window (local) attention**, which every change above used 
 requires the opt-in flag.
 
 GH200 (680 W cap), bf16, D=64, non-causal, 65,536 tokens/pass, mean of 3 seeds. Throughput,
-so higher is better. Gradients match upstream, and upstream's own test suite
-(`hopper/test_flash_attn.py`) passes — 1584 varlen and 720 non-varlen cases across
-headdim 64/96/128/192/256.
+so higher is better. Gradients match upstream, and the earlier non-local test run passed
+1584 varlen and 720 non-varlen cases across headdim 64/96/128/192/256. The later, wider local
+build reproduces one pre-existing D96 failure; see the sliding-window audit below.
 
 **These are attention-kernel numbers.** End to end, on 4 GPUs with FSDP, they are worth
 **+1.21%** of step time for a default build and **+1.51%** with the forward flag — because
@@ -58,7 +59,7 @@ attention is only 7.8% of a step in this model. Loss is unchanged to four decima
 
 ModernBERT-style protein models interleave sliding-window layers with full-attention ones — the
 default pattern is one full layer in three, so **10 of 16 layers** use a ±64 window. Those layers
-used to fall back to upstream's global-attention tiling and to the original backward path.
+used to use upstream's local-attention tiling and the original backward path.
 
 ![sliding window benchmark](docs/assets/sliding_window_gh200.png)
 
@@ -83,13 +84,20 @@ latency:
 | + 3 pipeline stages | **~0.298 ms** |
 
 The forward fast path needs both window bounds finite and ≤ 128 per side; wider windows keep
-upstream's tile. `local_attention: 128` in a ModernBERT config means ±64, so it qualifies.
+upstream's tile. It also requires BF16, D=V=64, MHA self-attention with one shared Q/K
+`cu_seqlens` object, no `seqused`, and no externally supplied scheduler metadata. The backward
+extension has no window-width bound. `local_attention: 128` in a ModernBERT config means ±64,
+so it qualifies when the other gate conditions hold.
 
 **End to end**, on a 4-GPU ModernBERT with 10 of 16 layers sliding, the two together are worth
-**~1.3%** of training step time (drift-corrected over 24 runs, se 0.15%). The backward change
-carries essentially all of it (~0.9%); the forward's contribution is below what the harness can
-resolve, which is expected — forward is about a third of attention time and attention is ~7.8% of
-a step. On an all-full-attention config the same binary measures no change, as it should.
+**~1.3% less training step time** (drift-corrected over 24 runs, model SE 0.14 percentage points).
+The backward change carries most of it (~0.9%); forward alone is unresolved. The all-full control,
+whose kernel instructions are unchanged, measures a small +0.28% step-time difference after
+correction. The detailed report includes this uncertainty and a script to regenerate the table.
+
+Dedicated regression tests in `hopper/test_flash_attn_local_varlen.py` cover the fast-path
+inputs, length and window boundaries, fallback calls, and scheduler-metadata reuse against
+FP32. The general upstream varlen tests use separate Q/K length arrays and miss these new paths.
 
 Mechanism, the register-pool trap that makes two neighbouring tunings hang, and the dQ padding
 invariant that keeps the backward from silently returning wrong gradients:

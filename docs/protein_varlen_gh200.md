@@ -618,18 +618,25 @@ request against the un-rounded `65536 / MinBlocksPerMultiprocessor` and lost exa
 | **M64/N64, math 160, 2 blocks/SM** | 256 | 128 | 32,768 | 128×160 + 128×56 = 27,648 | **ok** |
 
 The shipped configuration divides exactly (32768/256 = 128), so no rounding is lost. A
-`static_assert` in `flash_fwd_kernel_sm90.h` and `flash_bwd_kernel_sm90.h` now enforces this at
-compile time — several upstream configurations sit exactly on the limit, which is why the
-rounding matters.
+`static_assert` in `flash_fwd_kernel_sm90.h` and `flash_bwd_kernel_sm90.h` now checks the request
+against the rounded launch-bounds budget. Several upstream configurations sit exactly on that
+limit. This check assumes the compiler grants the estimated register budget; a future build
+with a lower actual allocation still needs its resource report checked.
 
 ### Backward: one buffer, two launches, one padding
 
 The backward splits the batch into two launches that **share one `dq_accum` buffer**: sequences
-≤ 256 on M32/N256, the rest on a second tile. Both must pad that buffer identically. The
-non-local path already agrees at 128 (M32/N256 is special-cased; M128/N128 gets 128 from
+of length **129–256** on M32/N256, and lengths **≤128 or >256** on a second tile. Both must pad
+that buffer identically. The non-local path already agrees at 128 (M32/N256 is special-cased;
+M128/N128 gets 128 from
 `kBlockM`). The local remainder is **M64/N128**, which would otherwise pad to 64 against a
 128-padded buffer — reading and writing at the wrong offsets, returning **silently wrong
 gradients** rather than crashing.
+
+The local M64/N128 launch handles its ≤128 sequences with direct dQ stores, skipping FP32
+clear/convert. Its >256 sequences use the accumulator and postprocess. All sequences in the
+129–256 partition use direct stores. The backward gate has no window-width bound; the forward
+64×64 specialization requires finite windows of at most 128 on each side.
 
 So the same predicate has to appear in three places that must agree:
 
@@ -656,11 +663,13 @@ Ragged local batches (bf16, D=64, window 64/64, 65,536 tokens, ~347 sequences, m
 | 2 | 0.3787 ms | 0.2945 ms | 1.2514 ms | 0.8843 ms |
 | **median** | **0.378** | **0.295** (−21.8%) | **1.287** | **0.882** (−31.2%) |
 
-Disassembling both builds, every one of the 211 pre-existing forward kernels is bit-identical
-and exactly one is added (the 3-stage M64/N64 specialization); on the backward side 199 shared
-kernels are identical, 11 are renamed by the new `QPad` template parameter with unchanged machine
-code, and 4 are added. Non-local and non-D=64 paths therefore execute the same instructions they
-did before.
+Comparing the base and forward-only audit builds, all 211 shared kernels (forward, backward,
+and auxiliary) are bit-identical, with one addition: the 3-stage M64/N64 specialization.
+On the backward side, 199 shared kernels are identical, 11 are renamed by the new `QPad`
+template parameter with unchanged machine code, and 4 are added. This establishes unchanged
+kernel instructions for pre-existing paths **within the compiled scope**. The SM90 BF16 audit
+builds disabled FP16, FP8, split KV, paged KV, append KV, softcap, packed GQA, and SM80; this
+comparison provides no binary evidence for those omitted features or for host dispatch costs.
 
 ### End-to-end
 
@@ -672,25 +681,40 @@ job with arm identity — step time fell monotonically along the arm order. A se
 order reversed decorrelates them; the model is `dt ~ arm + position + job + cold_start`, the last
 term because the first arm of each job runs ~1.8 ms slow while caches and clocks settle.
 
-| | + forward | + backward | + both | control (must be 0) |
+Percentages below are **candidate minus baseline step time**: negative means faster, positive
+slower. All use the observed SWA baseline median (369.9425 ms) as the denominator. The control
+is `ctlF_both - ctlF_base`, with covariance retained in its standard error.
+
+| | + forward | + backward | + both | all-full control |
 |---|---:|---:|---:|---:|
-| raw | −0.26% | −1.03% | −1.45% | −0.40% |
-| **drift-corrected** | **−0.14%** | **−0.90%** | **−1.32%** | −0.28% |
-| dropping position 1 | −0.19% | −0.97% | −1.39% | −0.23% |
+| without cold-start term | −0.26% | −1.03% | −1.45% | +0.40% |
+| **drift-corrected** | **−0.14%** | **−0.90%** | **−1.32%** | +0.28% |
+| dropping position 1 | −0.19% | −0.96% | −1.38% | +0.22% |
 
-se ≈ 0.15% per arm. The control runs the *same binary* on an all-full-attention config, where
-the machine code is provably identical, so it must read 0%; it reads −0.2% to −0.4% and never
-reaches significance, which sets ~0.3% as this harness's resolution floor.
+The corrected model gives SE 0.1434 percentage points per treatment and control contrast.
+These errors are conditional on the OLS model and its shared linear drift and independent
+residuals. The all-full control compares the baseline and combined builds on paths with
+unchanged kernel instructions. Its +0.28% step-time difference has t=1.96 (15 dof); without
+the cold-start correction, +0.40% gives t=2.54 (16 dof), significant at the two-sided 5% level
+under that model. This exposes residual uncertainty rather than proving a universal noise floor.
+The ~1.3% combined reduction persists across all three specifications.
 
-**The backward change carries the end-to-end result.** The forward's kernel win is larger in
-relative terms but forward is roughly a third of attention time, and attention is ~7.8% of a
-step, so its contribution lands under the noise floor. No forward-only end-to-end number is
-claimed.
+**The backward change carries most of the measured end-to-end result.** Forward occupies a
+smaller share of the step, and its fitted training effect is unresolved. The earlier all-full
+configuration measured attention at 7.8% of step time; that fraction is not a direct measurement
+of this sliding configuration. No forward-only training speedup is established.
+
+Run `python docs/analyze_sliding_window_e2e.py` from the repo root (requires NumPy) to regenerate
+the table and standard errors from [the 24 saved run medians](data/sliding_window_e2e_runs.json).
 
 ## Status and limitations
 
-* Gated at compile time to `Arch >= 90 && Varlen && !Is_causal && !Is_local && !GQA`.
-  Causal keeps `SingleTileBwdLPTScheduler`; everything else keeps `SingleTileScheduler`.
+* The backward persistent scheduler requires `Arch >= 90 && Varlen && !Is_causal && !GQA &&
+  !Deterministic`. Local attention additionally requires one of the dedicated D64 tiles;
+  its partitioned dispatch requires self-attention with the same Q/K `cu_seqlens` pointer,
+  no `seqused`, and no softcap. Generic local calls retain the original scheduler.
+  The forward local specialization is BF16-only, D=V=64, with both window bounds in [0,128];
+  metadata reuse and other gate exclusions retain the original tile.
 * **The gate does not adapt to workload shape.** Runtime tile-fill and length statistics could
   guide dispatch, but `cu_seqlens` is GPU-resident and the host does not already know the real
   tile count. Obtaining that metadata and selecting kernels has costs that must be measured.
@@ -707,10 +731,16 @@ claimed.
   it is real added dispatch complexity.
 * The forward flag (`FLASH_ATTENTION_SHORT_SEQ_TILES`) is **off by default** and regresses
   seqlen >= 2k; see the crossover table in Part 1. It affects only `headdim <= 64` non-causal,
-  but `kStages=3` under the same flag affects every SM90 forward config's shared-memory budget.
-* The fast paths are built and tuned for `headdim = 64`, bf16, SM90. Upstream's test suite
-  passes for headdim 64/96/128/192/256, but the other head dims all take the original path —
-  only D=64 is actually optimised here.
+  and the extra pipeline stage is restricted to SM90 configurations with both head dimensions
+  at most 64. The local 64×64 specialization uses three stages independently of this flag.
+* Performance measurements target `headdim = 64`, bf16, SM90. The local forward specialization
+  and local backward tiles target D64; the earlier global persistent scheduler is not limited
+  to D64. The wider selected upstream suite reports 4,607 passes and one pre-existing local
+  D96 failure with identical outcomes on baseline and candidate. Its separate Q/K length
+  arrays bypass the new self-attention paths, which are covered by dedicated tests instead.
+* `hopper/test_flash_attn_local_varlen.py` tests shared-pointer self-attention, partition and
+  window boundaries, fallback calls, and scheduler-metadata reuse against FP32. Both BF16 and
+  FP16 are parametrized, but the audit's FP16-disabled build cannot validate that dtype.
 
 ## Reproducing
 
@@ -719,12 +749,20 @@ claimed.
 cd hopper
 export FLASH_ATTN_CUDA_ARCHS=90
 export FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE   # optional: short-seq forward tiles
-for v in SPLIT PAGEDKV APPENDKV LOCAL SOFTCAP PACKGQA FP16 FP8 \
+for v in SPLIT PAGEDKV APPENDKV SOFTCAP PACKGQA FP16 FP8 \
          HDIM96 HDIM128 HDIM192 HDIM256 HDIMDIFF64 HDIMDIFF192 SM80; do
   export FLASH_ATTENTION_DISABLE_$v=TRUE
 done
+export FLASH_ATTENTION_DISABLE_LOCAL=FALSE
+export FLASH_ATTENTION_DISABLE_VARLEN=FALSE
+export FLASH_ATTENTION_DISABLE_BACKWARD=FALSE
+export FLASH_ATTENTION_DISABLE_HDIM64=FALSE
 python setup.py build_ext --inplace
+PYTHONPATH=. python -m pytest -q test_flash_attn_local_varlen.py
 ```
+
+Keep the build flags set when testing: this BF16 build skips the FP16 cases. To test FP16 as
+well, rebuild with `FLASH_ATTENTION_DISABLE_FP16=FALSE` and rerun with the same setting.
 
 Note that `setup.py` uses distutils' `newer_group()`, which compares `.cu` sources against the
 output `.so` and **ignores headers**. Editing any `.h`/`.hpp` will silently rebuild nothing.
@@ -744,9 +782,12 @@ The changes, benchmarks, profiling and this document were produced with
 [Claude Code](https://claude.com/claude-code) running **Claude Opus 5** at high reasoning
 effort, on the JUPITER cluster, under the repository owner's direction and review.
 
-Every number here is from a real run on a GH200; none are estimated or extrapolated. Upstream's
-own test suite is part of that: `hopper/test_flash_attn.py` passes on this branch across all
-five compiled head dimensions. Where a
+Subsequent review corrections, regression tests, and the reproducible training-table analysis
+were added with Codex.
+
+Kernel timings are from GH200 runs; the training tables report fits to recorded run medians.
+Upstream's selected tests retain baseline outcomes across the five compiled head dimensions,
+including the known local D96 failure in the wider build. Where a
 result is weak or inside measurement noise it is labelled as such — see the end-to-end section,
 where the effect is *not* separable from run-to-run variance. Where a hypothesis was falsified
 it is recorded as falsified rather than dropped, including the one that motivated the entire

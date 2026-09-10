@@ -1,4 +1,4 @@
-# Audit — sliding-window varlen forward
+# Audit — sliding-window varlen forward and backward
 
 Auditor: separate session. Target: `sliding_window_forward.patch` (198 lines, 6 files) against
 `fa_push` @ `d74a3c3`. Claim under audit: **21.3–21.9% less forward GPU time** on ragged
@@ -6,31 +6,32 @@ BF16/H16/D64 batches of 65,536 tokens with window 64/64.
 
 ## Verdict
 
-**Both patches reproduce and are safe to adopt.** Forward 21.8%, backward 31.2%, measured on my
-own builds with each patch isolated. No pre-existing kernel that actually executes has its
-machine code changed; the only added kernels are the intended ones. Upstream's suite is
-unchanged on all three arms. Accuracy versus FP32 is identical to the path being replaced.
+**Both patches reproduce on the audited BF16/D64/Hopper workload.** Forward time falls 21.8%
+and backward time 31.2%, measured on independent builds with each patch isolated. Within the
+compiled configurations, pre-existing kernels that execute retain their machine code; the added
+kernels are the intended ones. The selected upstream tests have unchanged outcomes, including
+the known D96 failure. Maximum errors versus FP32 match at the reported precision in the
+checked cases. These results do not establish coverage of features disabled in the builds.
 
-**Three changes I'd make before merging** — all cheap, none affect the measured binary:
+**Three changes incorporated in the fork** — none affect the measured binary:
 
-1. Add the `setmaxnreg` budget `static_assert` (section 2) to **both** `flash_fwd_kernel_sm90.h`
+1. Added the `setmaxnreg` budget `static_assert` (section 2) to **both** `flash_fwd_kernel_sm90.h`
    and `flash_bwd_kernel_sm90.h`. This exact failure mode has now bitten three separate
    configurations across two experiments (`backward_design`'s 64/224, and both rejects here) and
    it presents as a silent hang, not a compile error.
-2. Pass `false` explicitly at the `get_scheduler_metadata` call site (section 5), so
+2. Passed `false` explicitly at the `get_scheduler_metadata` call site (section 5), so
    producer/consumer agreement doesn't rest on `seqused_k` happening to be a mandatory argument.
-3. Fix the README: the four API call sites are inert, not load-bearing; and document that the
+3. Corrected the documentation: the four API call sites are inert, not load-bearing; the
    backward gate deliberately has no window bound while the forward gate is `[0, 128]`.
 
-**Value to nanoPLM: zero under the `attn_layer_pattern: 'F'` config the 4-GPU end-to-end test was
-run with — that config has no sliding layers at all.** Under the default stride-3 pattern it
-fires on 10 of 16 layers. I have not extrapolated a step-time number from the kernel deltas; that
-mapping was weak last round. Say the word and I'll measure it on the same harness.
+**Value to nanoPLM: about 1.3% less training step time on the measured `FSS` configuration**, with
+10 of 16 layers sliding (section 10). An all-full `F` configuration has no eligible layers and
+serves as a control. Its small measured slowdown is reported explicitly below.
 
 ---
 
-Status: **complete — static audit and full independent reproduction.** Findings below are ordered
-by what a reviewer needs to decide adoption.
+Status: **complete — static audit and independent reproduction within the recorded build scope.**
+Findings below are ordered by what a reviewer needs to decide adoption.
 
 ---
 
@@ -81,7 +82,8 @@ rounding is lost, and it holds 5,120 registers of slack — it would tolerate `p
 *occupancy* budget consuming the whole register file; that is by design and is not a fragility.)
 
 **Implemented and verified in both directions.** The assert below is now in the push candidate.
-It compiles clean across all 957 ptxas instantiations of a full build, and a negative control
+It compiles clean across all 957 ptxas instantiations of the feature-restricted audit build
+(flags listed in section 9), and a negative control
 (forcing `MinBlocksPerMultiprocessor = 2` onto the stock configs, reproducing the rejected
 variant's shape) fails at compile time with exactly the intended message:
 
@@ -106,9 +108,8 @@ matters so much:
 | *rejected* m128n64r112 | 30,720 | 31,744 | **−1,024** |
 | *rejected* m64n64r128b3 | 20,480 | 21,504 | **−1,024** |
 
-**Recommendation (cheap, high value).** Nothing in the source catches this class of error — a
-future retune gets a silent hang, not a compile failure. This assert would have caught both
-rejected variants and passes the accepted one:
+**Implemented guard.** This assert rejects both oversized register requests and passes the
+accepted configuration, under the allocation assumption below:
 
 ```cpp
 // ptxas rounds regs/thread down to a multiple of 8 under __launch_bounds__, and Hopper caps at 255.
@@ -150,27 +151,28 @@ is `headdim <= 64 && headdim_v == 512`, whose PV tile is `(64, 512, 64)` — exc
 `kHeadDimV` term. FP8 is excluded outright. So `LocalSmallTile` is true iff `small_local` was
 passed. Host and device agree.
 
-## 5. Eight of the twelve API hunks are inert
+## 5. Host tile queries and scheduler-metadata agreement
 
-The patch threads `use_small_local_fwd(params)` through four `tile_size_fwd_sm90` call sites in
-each of `flash_api.cpp` and `flash_api_stable.cpp`. **All four are unreachable-true today:**
+The original patch threaded `use_small_local_fwd(params)` through four `tile_size_fwd_sm90`
+call sites in each API implementation. The helper was false at all four; the merged version
+now passes `false` explicitly at the external-metadata producer:
 
 | Call site | Why the helper is always false there |
 |---|---|
 | `get_pagedkv_tma` | early-returns before the call unless `page_table != nullptr`; the gate requires `!page_table` |
-| `should_pack_gqa` | early-returns before the call unless `h != h_k`; the gate requires `h == h_k` |
+| `get_pack_gqa` | early-returns before the call unless `h != h_k`; the gate requires `h == h_k` |
 | `get_num_splits` | invoked from `params.num_splits = ... get_num_splits(params) ...`, so `params.num_splits` is still 0; the gate requires `== 1` |
+| `mha_fwd_get_scheduler_metadata` | the original helper was false because `seqused_k` is required; the merged code passes `false` explicitly |
 
 The `get_num_splits` one has a mild consequence worth knowing: the split heuristic therefore
 sizes itself with the 192x128 tile rather than 64x64. On any workload where it returns `> 1` the
 gate's `num_splits == 1` term would then silently disable the fast path. It returns 1 for the
 protein/nanoPLM regime — proven empirically, since the fast path demonstrably fires in the
 reproduction below (outputs change at window 64/64 and the kernel is 21.8% faster).
-| `mha_fwd_get_scheduler_metadata` | `seqused_k` is a **required** argument, so `params.seqused_k` is always non-null; the gate requires `!seqused_k` |
 
 This is harmless — those sites keep computing the upstream tile, which is what upstream did —
-but the README describes them as load-bearing ("used by both API implementations when computing
-tile-dependent metadata"), and they are not. The change that actually matters is
+but the original experiment notes incorrectly described them as load-bearing. The call that
+actually matters is
 `flash_fwd_launch_template.h:188`, which already calls `prepare_varlen_num_blocks` with the
 *templated* `kBlockM/kBlockN`, so the metadata the kernel consumes tracks `SmallLocal`
 automatically.
@@ -181,15 +183,10 @@ layout because `seqused_k` is mandatory, and the consumer (`mha_fwd`) can never 
 64/64 kernel because `skip_scheduler_metadata_computation` is set. A 64/64 metadata layout can
 never be fed to a 192/128 kernel. The safety is real; it just doesn't come from these hunks.
 
-**This consistency is accidental, and worth nailing down.** It holds only because `seqused_k`
-happens to be a mandatory argument of `get_scheduler_metadata`. If anyone later relaxes the
-gate's `!seqused_k` term, the producer starts emitting 64/64 metadata while the consumer still
-runs the 192/128 kernel — precisely the mismatch ruled out above. Cheap fix: pass `false`
-explicitly at the `get_scheduler_metadata` site with a one-line comment saying external metadata
-always drives the default kernel, so correctness doesn't hinge on an unrelated argument's
-optionality. The other three inert sites are harmless as they stand.
-
-The README should also stop describing these call sites as load-bearing.
+**The fork now makes this agreement explicit.** Both API implementations pass `false` at the
+external-metadata producer, with a comment explaining that metadata reuse selects the default
+kernel. A future change to `seqused_k` eligibility therefore cannot silently change this
+producer's tile. The other three inert sites retain the default tile as before.
 
 ## 6. Where the speedup comes from
 
@@ -214,7 +211,7 @@ Same shape of insight as the backward work: match the resource footprint to the 
 
 ## 7. Scope: there are **two** new experiments, not one
 
-`agent_space/sliding_window/` is a separate, also-unpushed **backward** patch claiming
+`agent_space/sliding_window/` contains the separate **backward** experiment claiming
 **29.5–32.6%** less backward time on the same ragged local batches. The forward work depends on
 it: `sliding_forward/final/` — the tree that was built, hashed and benchmarked — is
 `d74a3c3 + sliding_window_backward.patch + sliding_window_forward.patch`. I verified this by
@@ -237,7 +234,8 @@ Its provenance is equally clean: all 16 hashes in `sliding_window/final_hashes.j
 It is only 22 inserted lines, but they are load-bearing in a way the forward patch is not.
 
 `run_mha_bwd_hdim64` splits the batch into two launches that **share one `dq_accum` buffer**:
-sequences <= 256 on M32/N256, the rest on a second tile. Both launches must pad that buffer
+sequences of length **129–256** on M32/N256, and lengths **<=128 or >256** on a second tile.
+Both launches must pad that buffer
 identically or the second one reads and writes at the wrong offsets — silent wrong gradients,
 not a crash. In the non-local path both already pad to 128 (M32/N256 is special-cased to 128;
 M128/N128 gets 128 from `kBlockM`). The new local remainder is **M64/N128**, which would
@@ -264,24 +262,25 @@ The local remainder also flips `dQ_swapAB` to `true` (the README's "transposed d
 and that same flag is threaded into `PostprocessKernel`, so the accumulator layout agrees on both
 sides of the launch.
 
-Extending `direct_dq` to local is benign: it only feeds `skip_dq_short = kBlockN`, i.e. which
-sequences may skip the FP32 clear/convert. The local remainder launch has `kBlockN = 128` but
-holds only sequences longer than 256, so the threshold never fires there.
+For direct dQ stores, `skip_dq_short = kBlockN` controls which sequences skip FP32 clear/convert.
+The local remainder launch has `kBlockN = 128` and contains both <=128 and >256 lengths. Its
+<=128 sequences use direct stores and skip clear/convert; >256 sequences use the accumulator
+and postprocess. The 129–256 launch uses direct stores for its entire partition.
 
-**Two things I have not yet confirmed for the backward patch**, both empirical:
+**Two questions raised by the static review**, subsequently checked in section 9:
 
 1. `run_mha_bwd_hdim64`'s gate dropped `!params.is_local` **without adding any window-size
    bound**, unlike the forward gate's `[0, 128]`. Any local D64 varlen self-attention now takes
    the partitioned path at any window width. That is plausibly fine (the mask is applied by the
    existing local-mask code, and tile choice doesn't depend on window), but it is untested
-   territory that their sweeps at window 0/16/64/128/256 only partly cover.
+   territory that the original sweeps at window 0/16/64/128/256 only partly covered.
 2. `UsePersistentBwd` is now enabled for local. The n-block persistent scheduler must produce
-   correct per-n-block m-ranges under a local mask. Non-deterministic dQ accumulation is
-   order-independent, and `Deterministic` stays excluded, so the risk is bounded — but this is
+   correct per-n-block m-ranges under a local mask. Floating-point dQ accumulation can vary
+   with atomic-add ordering, and `Deterministic` stays excluded — this is
    the same class as the `TensorStorage` aliasing trap and deserves the gradient check, not a
    reading.
 
-I am rebuilding `d74a3c3 + backward patch` separately to test this arm in isolation.
+The independent `d74a3c3 + backward patch` rebuild and gradient checks are complete (section 9).
 
 ## 8. Does this help nanoPLM training?
 
@@ -305,9 +304,8 @@ So the fast path *would* fire — on sliding layers only. Which layers those are
 - With the default `global_attn_every_n_layers: 3`, full attention lands on `i % 3 == 0`, so a
   16-layer model gets 6 full and **10 sliding** layers — those 10 would use both new kernels.
 
-I am deliberately not extrapolating a step-time number from the kernel percentages; the previous
-round showed how weakly kernel deltas map to end-to-end. If you want the figure, the right move
-is the same 4-GPU e2e harness with a sliding pattern, which I can run once the arms are built.
+Section 10 reports the completed 4-GPU experiment with the `FSS` sliding pattern, measured
+directly rather than extrapolated from kernel percentages.
 
 One caveat if `use_paired_head_attention` is ever enabled (it is `false` in this config):
 `_pair_flash_window_size` (`modeling.py:77`) doubles the window, so `(64, 64)` becomes
@@ -322,6 +320,12 @@ path silently, with no warning.
 
 Fresh builds of `d74a3c3` (base), `d74a3c3 + forward patch` (cand) and
 `d74a3c3 + backward patch` (cand_bwd), built by me from the patches with their build flags.
+These are SM90 BF16 builds with local attention and backward enabled across the five tested
+head dimensions. `SPLIT`, `PAGEDKV`, `APPENDKV`, `SOFTCAP`, `PACKGQA`, `FP16`, `FP8`, and `SM80`
+are disabled (`sfaudit/build.sbatch` and `sfaudit/one.sbatch`). The compile and disassembly
+claims below apply to this scope; they do not validate those omitted features. In particular,
+the new local backward dispatch also accepts FP16 when built, but these runs did not test it.
+
 Run on `jpbo-010-07`, a **900 W** GH200 (their runs were on a 680 W node), two fresh processes
 per arm per seed, interleaved base/cand/base/cand on one pinned GPU. Absolute times therefore
 differ slightly from their tables; the ratio is the comparable quantity.
@@ -359,7 +363,9 @@ hitting every boundary of the 256-token partition and the M64/N128 remainder til
 
 Zero failures on both arms, and the patched arm's max gradient error equals the unpatched arm's
 to five decimal places in **every** configuration (worst cand/base error ratio 1.00). The
-unbounded window is not a problem in practice.
+checks found no regression over this sweep. Sequence lengths stop at 2048, so windows 2048
+and 4096 normalize to full attention here; they do not test genuinely local 4096-wide windows
+on longer sequences.
 
 ### 9b. Upstream suite
 
@@ -380,6 +386,18 @@ All three arms produce the identical line:
 Same failing test id in all three. Neither patch introduces, masks, or changes a single test
 outcome across headdim 64/96/128/192/256.
 
+These upstream tests build separate Q/K `cu_seqlens` arrays and pass `seqused`, so they do not
+enter the new self-attention fast paths. Fast-path correctness was checked by the dedicated
+validators. The fork now also includes `hopper/test_flash_attn_local_varlen.py`: it uses one
+shared `cu_seqlens` object without `seqused`, tests all-short/all-middle/all-long/mixed batches,
+checks window boundaries on both sides of 128, and compares output, LSE, and gradients with an
+independent FP32 reference. Distinct-pointer fallback and external metadata reuse are covered.
+BF16 and FP16 are parametrized; FP16 cases skip when that dtype is disabled in the build.
+
+Review follow-up: this repository test passed **38 cases, with 36 FP16 cases skipped** on one
+GH200 in Booster job 1739584. It used the previously audited `sfaudit/merge` extension; all ten
+changed kernel/API source files match the fork. The allocation was released after testing.
+
 Two things to be precise about here:
 
 - This proves the failure is pre-existing **in the fork**. That it is also pre-existing in
@@ -391,7 +409,7 @@ Two things to be precise about here:
   `BACKWARD` are both enabled — which this build does, across all five head dimensions. The
   unpatched baseline arm here fails identically, which is the decisive control.
 
-### 9c. Collateral change: provably zero
+### 9c. Unchanged machine code within the compiled scope
 
 Rather than argue from benchmarks that non-local workloads are unaffected, I disassembled both
 `.so` files and compared kernel by kernel:
@@ -401,9 +419,10 @@ Rather than argue from benchmarks that non-local workloads are unaffected, I dis
   `FlashAttnFwdSm90<CollectiveMainloopFwdSm90<3, ..., tuple<C<64>,C<64>,C<64>>, 64, bfloat16_t, ...>>`
   — 3 stages, M64/N64/64, BF16.
 
-So every pre-existing forward and backward kernel is bit-identical machine code. Non-local,
-non-D64, FP8, causal and paged paths cannot regress; they execute the same instructions they did
-before the patch. This is a stronger guarantee than "measured within noise."
+Every pre-existing kernel in these binaries is bit-identical machine code, including forward,
+backward, and auxiliary kernels. This covers the compiled non-local, non-D64, and causal paths.
+It provides no binary evidence for FP8 or paged paths, which were disabled, or for the other
+omitted features listed above. Kernel disassembly also does not measure host dispatch overhead.
 
 (Method note: `cuobjdump` embeds an `identifier = <source path>` line per kernel, which differs
 purely because my two build trees have different directory names. Filtering that line is
@@ -446,7 +465,7 @@ change at 1 BF16 ULP.
 
 Note this also shows the backward gate really does have no window bound: `(512,512)` takes the
 new path in backward while the forward gate correctly rejects it. That asymmetry is intentional
-per the code but undocumented; see section 7.
+and is documented in section 7 and the README.
 
 Running their own `validate.py` against **both** arms gives the apples-to-apples accuracy answer
 — max output error vs an independent FP32 reference, same 14 cases:
@@ -455,8 +474,9 @@ Running their own `validate.py` against **both** arms gives the apples-to-apples
 w-1_0 .008537 | w-1_64 .004593 | w0_0 0 | w128_128 .004593 | w16_32 .004593 | w256_256 .004593 |
 w64_-1 .004593 | w64_64 .004593`
 
-**Identical to six decimals in every case, both arms PASS, worst ratio 1.00.** The fast path is
-exactly as accurate as the path it replaces.
+**Identical maximum errors to six decimals in every checked case, both arms PASS, worst ratio
+1.00.** This is evidence of comparable accuracy for these cases, not bitwise equality of their
+outputs or a guarantee for untested inputs.
 
 ### 9e. Backward patch collateral: fully accounted for
 
@@ -475,8 +495,8 @@ Same disassembly treatment for `base` vs `cand_bwd`:
 - **4 genuinely new kernels**: the two local backward mainloops (M32/N256 and M64/N128) and their
   two matching postprocess kernels. Exactly the intended additions.
 
-So neither patch alters the machine code of any kernel that actually executes on a pre-existing
-path.
+Within these feature-restricted builds, neither patch alters the machine code of kernels that
+execute on pre-existing paths.
 
 ## 10. End-to-end: nanoPLM ModernBERT, 4x GH200, sliding-window pattern
 
@@ -492,31 +512,43 @@ reversed and fitted `dt ~ arm + position + job + cold_start`, which decorrelates
 arm of each job is genuinely slow (**+1.82 ms**, se 0.68 — cache/clock ramp), which a linear
 position term cannot absorb.
 
-| specification | + forward | + backward | + both | control (must be 0) |
-|---|---:|---:|---:|---:|
-| raw (drift-contaminated) | −0.26% | −1.03% | −1.45% | −0.40% |
-| **+ cold-start term** | **−0.14%** | **−0.90%** | **−1.32%** | −0.28% |
-| drop position 1 | −0.19% | −0.97% | −1.39% | −0.23% |
+All entries are **candidate minus baseline step time**: negative is faster, positive slower.
+Every percentage uses the observed SWA baseline median, 369.9425 ms, as its denominator.
+The control is the within-model contrast `ctlF_both - ctlF_base`, with covariance retained when
+computing its standard error.
 
-se ≈ 0.15% on each arm (n=24, dof=15, residual sd 0.71 ms).
+| specification | + forward | + backward | + both | all-full control |
+|---|---:|---:|---:|---:|
+| without cold-start term | −0.26% | −1.03% | −1.45% | +0.40% |
+| **+ cold-start term** | **−0.14%** | **−0.90%** | **−1.32%** | +0.28% |
+| drop position 1 | −0.19% | −0.96% | −1.38% | +0.22% |
+
+The cold-start model gives SE 0.1434 percentage points for each treatment and the control
+contrast (n=24, dof=15, residual sd 0.71 ms). These uncertainties are conditional on the OLS
+model, including its shared linear drift and independent-residual assumptions; the runs were
+ordered and then reversed, not randomized.
 
 **Conclusions:**
 
-- **Both patches together: ~1.3% faster training step** (−1.32%, se 0.15% — about 9 sigma).
+- **Both patches together: ~1.3% less training step time** (−1.32%, model SE 0.14 percentage points).
 - **Backward alone carries it: ~0.9%.** Consistent across every specification and both job
   orderings.
-- **Forward alone is not resolvable** (−0.14%, se 0.15%). That is expected rather than
-  disappointing: forward is roughly a third of attention time, attention is ~7.8% of a step, and
-  10 of 16 layers qualify, so a 21.8% forward kernel win predicts ~0.3% of a step — at or below
-  this harness's noise floor. Do not quote a forward-only end-to-end number.
-- **The control bounds the systematic error.** Running the *same binary* on the no-sliding `'F'`
-  config, where the machine code is provably identical, should read 0%; it reads −0.2% to −0.4%
-  and never reaches significance (~1.4 sigma). So ~0.3% is the floor of what this harness can
-  resolve. If that residual is systematic rather than noise the headline understates the gain by
-  ~0.3%; if it is noise the headline is unbiased. Either way −1.3% is defensible.
+- **Forward alone is not resolved** (−0.14%, model SE 0.14 percentage points). Forward is a small
+  share of total step time; the earlier all-full-attention run measured attention at 7.8% of a
+  step, but that fraction should not be assumed exact for the sliding configuration. Do not
+  present the fitted forward-only coefficient as an established training speedup.
+- **The control exposes residual uncertainty.** Baseline and combined builds should have no
+  kernel-induced difference on the all-full `'F'` config. The measured control instead reads
+  **+0.28% step time** after correction (t=1.96, 15 dof); without the cold-start term it reads
+  +0.40% (t=2.54, 16 dof), which is significant at the two-sided 5% level under that model.
+  Dropping first positions gives +0.22% (t=1.55, 14 dof). It is therefore incorrect to say the
+  control is always insignificant or proves a universal noise floor. The ~1.3% combined gain
+  persists across the three specifications, with this residual uncertainty noted.
 
-Raw logs `e2eswa/e2e_*.log` (forward order) and `e2eswa/rev_e2e_*.log` (reverse order);
-`e2eswa/analyze_final.py` regenerates the table.
+Raw logs: `e2eswa/e2e_*.log` (forward order) and `e2eswa/rev_e2e_*.log` (reverse order).
+The 24 extracted medians are retained in [data/sliding_window_e2e_runs.json](data/sliding_window_e2e_runs.json).
+Run `python docs/analyze_sliding_window_e2e.py` from the repo root (requires NumPy) to regenerate
+all three rows, the control contrast, and the model standard errors without the scratch logs.
 
 ---
 
@@ -535,10 +567,11 @@ Raw logs `e2eswa/e2e_*.log` (forward order) and `e2eswa/rev_e2e_*.log` (reverse 
 | **Independent timing reproduction** | done — fwd 21.82%, bwd 31.23%, both reproduce |
 | **Upstream suite, all 3 arms** | done — identical results, D96 failure pre-existing |
 | **Backward window-bound gap (my addition)** | done — 40 configs, 0 failures, accuracy ratio 1.00 |
-| **Non-local SASS no-op check** | done — 211/211 kernels bit-identical, +1 new |
+| **SASS comparison within the build scope** | done — 211/211 shared kernels bit-identical, +1 new |
 | **Long-running hang stress** | done — 231,232 iters / ~4.6M launches / 29 min, no stall |
 
-**The reproduction is green.** Every row above is done.
+**The reproduction is complete within the recorded scope.** Every row above is done; the
+pre-existing D96 test failure remains, and omitted build features are not covered by these runs.
 
 Hang stress detail: 231,232 iterations of 20 forward launches each (~4.6M launches) on freshly
 regenerated ragged batches over 29 minutes, no stall. This was expected to pass — the SASS shows
