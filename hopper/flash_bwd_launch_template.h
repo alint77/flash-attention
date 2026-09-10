@@ -45,7 +45,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, bool all_direc
     using ElementAccum = float;
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
-    constexpr int QPad = kHeadDim == 64 && kBlockM == 32 && kBlockN == 256 ? 128 : kBlockM;
+    constexpr int QPad = Arch >= 90 && kHeadDim == 64 && ((kBlockM == 32 && kBlockN == 256) || (Is_local && kBlockM == 64 && kBlockN == 128)) ? 128 : kBlockM;
     int const total_q_padded_rounded = cute::round_up(params.total_q + params.b * QPad, QPad);
     int const total_k_padded_rounded = cute::round_up(params.total_k + params.b * kBlockN, kBlockN);
     bool const is_varlen_q = params.cu_seqlens_q;
@@ -57,7 +57,11 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, bool all_direc
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? params.b : 1;
 
-    bool const direct_dq = Arch >= 90 && kHeadDim == 64 && Varlen && !Is_causal && !Is_local && !Has_softcap && !Deterministic && !GQA
+    // Only the dedicated self-attention branches select these local tile shapes.
+    // Keep generic local/cross-attention calls on their existing scheduler and dQ path.
+    constexpr bool UseLocalFastTile = Arch >= 90 && kHeadDim == 64
+        && ((kBlockM == 32 && kBlockN == 256) || (kBlockM == 64 && kBlockN == 128));
+    bool const direct_dq = Arch >= 90 && kHeadDim == 64 && Varlen && !Is_causal && (!Is_local || UseLocalFastTile) && !Has_softcap && !Deterministic && !GQA
         && params.cu_seqlens_q && params.cu_seqlens_q == params.cu_seqlens_k
         && params.seqused_q == params.seqused_k;
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
@@ -118,7 +122,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, bool all_direc
     // Deterministic mode serializes dQ accumulation through dq_semaphore, which assumes a
     // particular order of n_blocks per (batch, head).  The persistent scheduler hands tiles
     // out in a different order and that interaction is untested, so exclude it.
-    static constexpr bool UsePersistentBwd = (Arch >= 90) && Varlen && !Is_causal && !Is_local && !GQA && !Deterministic;
+    static constexpr bool UsePersistentBwd = (Arch >= 90) && Varlen && !Is_causal && (!Is_local || UseLocalFastTile) && !GQA && !Deterministic;
     using Scheduler = std::conditional_t<
         Is_causal,
         flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
@@ -261,7 +265,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream, bool all_direc
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,
         typename AttnKernel::CollectiveMainloop::TiledMmadQ,
-        AttnKernel::CollectiveMainloop::dQ_swapAB
+        AttnKernel::CollectiveMainloop::dQ_swapAB, QPad
         >;
     typename PostprocessKernel::Arguments postprocess_args {
         static_cast<ElementAccum const*>(params.dq_accum_ptr),
@@ -348,7 +352,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
 template<int Arch, typename T, bool Has_softcap>
 void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
     if constexpr (Arch >= 90 && !Has_softcap) {
-        if (!params.is_causal && !params.is_local && !params.deterministic && params.h==params.h_k
+        if (!params.is_causal && !params.deterministic && params.h==params.h_k
             && params.cu_seqlens_q && params.cu_seqlens_q==params.cu_seqlens_k
             && !params.seqused_q && !params.seqused_k && params.b>0) {
             int* fast=params.tile_count_semaphore+1;
@@ -356,10 +360,18 @@ void run_mha_bwd_hdim64(Flash_bwd_params &params, cudaStream_t stream) {
             partition_backward_lengths<<<cute::ceil_div(params.b,128),128,0,stream>>>(params.cu_seqlens_q,fast,rest,params.b);
             CHECK_CUDA(cudaGetLastError());
             params.seqused_q=fast;params.seqused_k=fast;
-            run_flash_bwd<Arch,64,32,256,T,false,false,false,true,false,false,2,2,true,false,true,2,1,2,2,false>(params,stream,true);
+            BOOL_SWITCH(params.is_local, Local, [&] {
+                run_flash_bwd<Arch,64,32,256,T,false,Local,false,true,false,false,2,2,true,false,true,2,1,2,2,false>(params,stream,true);
+            });
             CHECK_CUDA(cudaMemsetAsync(params.tile_count_semaphore,0,sizeof(int),stream));
             params.seqused_q=rest;params.seqused_k=rest;
-            run_flash_bwd<Arch,64,128,128,T,false,false,false,true,false,false,2,2,true,false,false,2,1,2,2,false>(params,stream,false,true);
+            BOOL_SWITCH(params.is_local, Local, [&] {
+                if constexpr (Local) {
+                    run_flash_bwd<Arch,64,64,128,T,false,true,false,true,false,false,2,2,true,false,true,2,1,2,2,false>(params,stream,false,true);
+                } else {
+                    run_flash_bwd<Arch,64,128,128,T,false,Local,false,true,false,false,2,2,true,false,false,2,1,2,2,false>(params,stream,false,true);
+                }
+            });
             params.seqused_q=nullptr;params.seqused_k=nullptr;
             return;
         }

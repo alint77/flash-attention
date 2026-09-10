@@ -60,7 +60,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
-    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, (kHeadDim == 64 && kBlockM == 32 && kBlockN == 256) ? 128 : kBlockM>;
+    using SeqlenInfo_t = flash::SeqlenInfoQK<Varlen, (kHeadDim == 64 && ((kBlockM == 32 && kBlockN == 256) || (Is_local && kBlockM == 64 && kBlockN == 128))) ? 128 : kBlockM>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local>;
 
     static_assert(ArchTag::kMinComputeCapability >= 90);

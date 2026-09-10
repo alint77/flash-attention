@@ -19,7 +19,7 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class TiledMma, bool dQ_swapAB>
+template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class TiledMma, bool dQ_swapAB, int QPad = 0>
 class FlashAttnBwdPostprocessConvertdQ {
 
 public:
@@ -170,7 +170,7 @@ public:
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
 
-        flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
+        flash::SeqlenInfo<true /*Varlen*/, QPad == 0 ? kBlockM : QPad> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
         bool const is_varlen = params.cu_seqlens;
         if (is_varlen && (m_block * kBlockM >= seqlen_info.seqlen || seqlen_info.seqlen <= params.skip_dq_short)) { return; }
 

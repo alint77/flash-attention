@@ -63,6 +63,21 @@ public:
     /// Register requirement for Load and Math WGs
     static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 24 : 32;
     static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 240 : 160;
+    // A warpgroup's setmaxnreg request is served from this CTA's register pool, whose size is
+    // (registers/thread granted at launch) * MaxThreadsPerBlock.  Under __launch_bounds__ ptxas
+    // rounds registers/thread DOWN to a multiple of 8 (and Hopper caps it at 255), so the pool can
+    // be smaller than 65536 / MinBlocksPerMultiprocessor.  When the combined request exceeds it,
+    // setmaxnreg compiles to a USETMAXREG.TRY_ALLOC retry loop that can never succeed: the kernel
+    // spins at 100% GPU forever with no diagnostic.  Catch it here instead of at runtime.
+    static constexpr uint32_t kRegsPerThreadBudget =
+        ((65536u / MinBlocksPerMultiprocessor / MaxThreadsPerBlock) > 255u
+             ? 255u
+             : (65536u / MinBlocksPerMultiprocessor / MaxThreadsPerBlock)) & ~7u;
+    static_assert(MmaRegisterRequirement * (NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup)
+                      + LoadRegisterRequirement * (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup)
+                  <= kRegsPerThreadBudget * MaxThreadsPerBlock,
+                  "setmaxnreg request exceeds the CTA register pool: the kernel would hang.");
+
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
