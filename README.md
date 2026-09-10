@@ -8,7 +8,7 @@ A UniRef-style batch is ~65,536 tokens made of ~350 sequences with a **median le
 and a long tail out past 900 — nothing like the multi-thousand-token sequences upstream's
 defaults are tuned for.
 
-Three changes, all scoped to non-causal varlen with `headdim <= 64`:
+Five changes, all scoped to varlen with `headdim <= 64`. Three for ordinary (global) attention:
 
 1. **Persistent n-block backward scheduler** (default on). Upstream's backward launches a
    *rectangular* grid — every sequence gets as many KV blocks as the *longest* sequence in
@@ -23,6 +23,14 @@ Three changes, all scoped to non-causal varlen with `headdim <= 64`:
 3. **Short-sequence forward tiles** (opt-in: `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE`). A narrow
    KV tile (192×80, `IntraWGOverlap=false`) plus a deeper pipeline (`kStages=3`), which suits
    short sequences but **regresses long ones**, hence the flag.
+
+and two for **sliding-window (local) attention**, which every change above used to skip:
+
+4. **A 64×64 forward tile for narrow windows** (default on). Upstream serves local layers from
+   the same 192×128 tile it uses for global attention, where most of each KV tile is masked out
+   and discarded. Matching the tile to the window is necessary but not sufficient — see below.
+5. **The backward path extended to local attention** (default on). The persistent scheduler, the
+   length partition and the direct dQ stores were all gated off for `is_local`.
 
 ![protein varlen benchmark](docs/assets/protein_varlen_gh200.png)
 
@@ -45,6 +53,49 @@ headdim 64/96/128/192/256.
 **+1.21%** of step time for a default build and **+1.51%** with the forward flag — because
 attention is only 7.8% of a step in this model. Loss is unchanged to four decimals
 [(details)](docs/protein_varlen_gh200.md#end-to-end-training).
+
+### Sliding-window attention
+
+ModernBERT-style protein models interleave sliding-window layers with full-attention ones — the
+default pattern is one full layer in three, so **10 of 16 layers** use a ±64 window. Those layers
+used to fall back to upstream's global-attention tiling and to the original backward path.
+
+![sliding window benchmark](docs/assets/sliding_window_gh200.png)
+
+Ragged local batches, bf16, D=64, window 64/64, 65,536 tokens/pass, 3 seeds:
+
+| | upstream tiling | this fork | time reduction | in a default build? |
+|---|---|---|---|---|
+| forward | 0.378 ms | **0.295 ms** | **−21.8%** | yes |
+| backward | 1.287 ms | **0.882 ms** | **−31.2%** | yes |
+
+Shrinking the forward tile is necessary but not sufficient. On its own the 64×64 tile is
+*slower* than the 192×128 it replaces (0.399 ms vs 0.380 ms): it compiles to 255 registers per
+thread, which leaves **one** CTA resident and 7.8% achieved occupancy. Cutting the math warpgroup
+to 160 registers lets two CTAs co-reside, and a third pipeline stage covers the shorter per-tile
+latency:
+
+| | forward |
+|---|---:|
+| upstream 192×128 tile | ~0.380 ms |
+| 64×64 tile alone | ~0.399 ms — *worse* |
+| + 160 registers, 2 blocks/SM, 2× grid | ~0.304 ms |
+| + 3 pipeline stages | **~0.298 ms** |
+
+The forward fast path needs both window bounds finite and ≤ 128 per side; wider windows keep
+upstream's tile. `local_attention: 128` in a ModernBERT config means ±64, so it qualifies.
+
+**End to end**, on a 4-GPU ModernBERT with 10 of 16 layers sliding, the two together are worth
+**~1.3%** of training step time (drift-corrected over 24 runs, se 0.15%). The backward change
+carries essentially all of it (~0.9%); the forward's contribution is below what the harness can
+resolve, which is expected — forward is about a third of attention time and attention is ~7.8% of
+a step. On an all-full-attention config the same binary measures no change, as it should.
+
+Mechanism, the register-pool trap that makes two neighbouring tunings hang, and the dQ padding
+invariant that keeps the backward from silently returning wrong gradients:
+**[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md#part-4--sliding-window-local-attention)**.
+Full audit with independent rebuild and reproduction:
+[docs/sliding_window_audit.md](docs/sliding_window_audit.md).
 
 ### Forward needs short sequences; backward does not
 

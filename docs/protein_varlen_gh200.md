@@ -564,6 +564,129 @@ stores, when the combined attention gain was +12.5% — gave +0.49% (backward on
 
 ---
 
+## Part 4 — Sliding-window (local) attention
+
+ModernBERT-style models interleave sliding-window layers with full-attention ones. Everything in
+Parts 1–3 was gated off for them: `is_local` excluded the persistent backward scheduler, the
+length partition, the direct dQ stores, and the forward tile choice. This part opens those gates.
+
+### Forward: match the tile to the window, then pay for it in registers
+
+Upstream selects a 192×128 tile for local D=64. With a ±64 window, most of each 128-wide KV tile
+is masked out and discarded. A 64×64 tile fits the window — but on its own it is **slower**:
+
+| step | time |
+|---|---:|
+| baseline, upstream 192×128 tile | ~0.380 ms |
+| 64×64 tile only | ~0.399 ms |
+| + 160 math registers, 2 blocks/SM, 2× grid | ~0.304 ms |
+| + 3 pipeline stages | **~0.298 ms** |
+
+The small tile compiles to 255 registers/thread, which leaves **one** CTA resident and 7.8%
+achieved occupancy — worse than the wide tile it replaced. Cutting `MmaRegisterRequirement` to
+160 and setting `MinBlocksPerMultiprocessor = 2` lets two CTAs co-reside (15.65% occupancy, 0.31
+→ 0.67 eligible warps/scheduler); the grid doubles to match. Tile shape and occupancy have to
+move together — either alone is a regression.
+
+Doubling the grid is safe because the dynamic scheduler hands out subsequent work as
+`atomicAdd(tile_count_semaphore, 1) + gridDim.x`, so tile ownership stays unique at any grid
+width, and CTAs that draw no work exit immediately.
+
+### The register-pool trap
+
+Two neighbouring configurations were tried and **hung** — 100% GPU, no progress, no diagnostic.
+The mechanism is worth writing down because it is invisible in source.
+
+`cutlass::arch::warpgroup_reg_alloc<N>()` compiles to:
+
+```
+USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xa0   # ask for N registers/thread
+PLOP3.LUT P0, PT, PT, PT, UP0, 0x80, 0x0 # did it succeed?
+@!P0 BRA <back to the TRY_ALLOC>         # no -> retry, forever
+```
+
+An unsatisfiable request is an infinite spin, not an error. The pool is
+`(registers/thread granted at launch) × MaxThreadsPerBlock` — and under `__launch_bounds__`,
+ptxas rounds registers/thread **down** to a multiple of 8. Both hung configurations sized their
+request against the un-rounded `65536 / MinBlocksPerMultiprocessor` and lost exactly one
+8-register step:
+
+| config | threads | ptxas regs/thread | pool | request | |
+|---|---:|---:|---:|---:|---|
+| M128/N64, math 112 | 384 | 80 | 30,720 | 256×112 + 128×24 = 31,744 | hangs |
+| M64/N64, math 128, 3 blocks/SM | 256 | 80 | 20,480 | 128×128 + 128×40 = 21,504 | hangs |
+| **M64/N64, math 160, 2 blocks/SM** | 256 | 128 | 32,768 | 128×160 + 128×56 = 27,648 | **ok** |
+
+The shipped configuration divides exactly (32768/256 = 128), so no rounding is lost. A
+`static_assert` in `flash_fwd_kernel_sm90.h` and `flash_bwd_kernel_sm90.h` now enforces this at
+compile time — several upstream configurations sit exactly on the limit, which is why the
+rounding matters.
+
+### Backward: one buffer, two launches, one padding
+
+The backward splits the batch into two launches that **share one `dq_accum` buffer**: sequences
+≤ 256 on M32/N256, the rest on a second tile. Both must pad that buffer identically. The
+non-local path already agrees at 128 (M32/N256 is special-cased; M128/N128 gets 128 from
+`kBlockM`). The local remainder is **M64/N128**, which would otherwise pad to 64 against a
+128-padded buffer — reading and writing at the wrong offsets, returning **silently wrong
+gradients** rather than crashing.
+
+So the same predicate has to appear in three places that must agree:
+
+| site | consumer |
+|---|---|
+| `flash_bwd_launch_template.h` `QPad` | `total_q_padded_rounded`, preprocess tile and grid |
+| `mainloop_bwd_sm90_tma_gmma_ws.hpp` `SeqlenInfo_t` | mainloop dQ-accum offsets |
+| `flash_bwd_postprocess_kernel.h` (`QPad` template arg) | postprocess dQ-accum offsets |
+
+The padding is sound for every length: a sequence of length `s` writes up to
+`ceil_div(s,64)·64` rows into a region of `round_up(s,128)`, and for `s = 128a + r`
+(`0 < r ≤ 128`), `ceil_div(s,64)·64 = 128a + 64·ceil(r/64) ≤ 128a + 128`. Tight at `r = 65..128`,
+never over.
+
+### Measurements
+
+Ragged local batches (bf16, D=64, window 64/64, 65,536 tokens, ~347 sequences, median length
+163), 3 seeds, two fresh processes per variant per seed, interleaved on one pinned GPU:
+
+| seed | forward, upstream tiling | forward, fork | backward, upstream tiling | backward, fork |
+|---|---:|---:|---:|---:|
+| 0 | 0.3777 ms | 0.2950 ms | 1.2868 ms | 0.8823 ms |
+| 1 | 0.3774 ms | 0.2970 ms | 1.3076 ms | 0.8770 ms |
+| 2 | 0.3787 ms | 0.2945 ms | 1.2514 ms | 0.8843 ms |
+| **median** | **0.378** | **0.295** (−21.8%) | **1.287** | **0.882** (−31.2%) |
+
+Disassembling both builds, every one of the 211 pre-existing forward kernels is bit-identical
+and exactly one is added (the 3-stage M64/N64 specialization); on the backward side 199 shared
+kernels are identical, 11 are renamed by the new `QPad` template parameter with unchanged machine
+code, and 4 are added. Non-local and non-D=64 paths therefore execute the same instructions they
+did before.
+
+### End-to-end
+
+nanoPLM ModernBERT, 4× GH200, `attn_layer_pattern: 'FSS'` — 10 of 16 layers sliding, window
+(64, 64), head_dim 64. 24 training runs of 80 steps; median step time over steps 20–75.
+
+The first job ran all six arms in the same order every repeat, which confounds position in the
+job with arm identity — step time fell monotonically along the arm order. A second job with the
+order reversed decorrelates them; the model is `dt ~ arm + position + job + cold_start`, the last
+term because the first arm of each job runs ~1.8 ms slow while caches and clocks settle.
+
+| | + forward | + backward | + both | control (must be 0) |
+|---|---:|---:|---:|---:|
+| raw | −0.26% | −1.03% | −1.45% | −0.40% |
+| **drift-corrected** | **−0.14%** | **−0.90%** | **−1.32%** | −0.28% |
+| dropping position 1 | −0.19% | −0.97% | −1.39% | −0.23% |
+
+se ≈ 0.15% per arm. The control runs the *same binary* on an all-full-attention config, where
+the machine code is provably identical, so it must read 0%; it reads −0.2% to −0.4% and never
+reaches significance, which sets ~0.3% as this harness's resolution floor.
+
+**The backward change carries the end-to-end result.** The forward's kernel win is larger in
+relative terms but forward is roughly a third of attention time, and attention is ~7.8% of a
+step, so its contribution lands under the noise floor. No forward-only end-to-end number is
+claimed.
+
 ## Status and limitations
 
 * Gated at compile time to `Arch >= 90 && Varlen && !Is_causal && !Is_local && !GQA`.
