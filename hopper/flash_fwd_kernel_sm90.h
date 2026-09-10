@@ -74,17 +74,36 @@ public:
     static constexpr uint32_t NumLoadWarpGroups = 1;
     static constexpr uint32_t NumMmaWarpGroups = CUTE_STATIC_V(size(TiledMmaPV{})) / cutlass::NumThreadsPerWarpGroup;
     static constexpr uint32_t MaxThreadsPerBlock = CUTE_STATIC_V(size(TiledMmaPV{})) + (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup);
-    static constexpr uint32_t MinBlocksPerMultiprocessor = 1;
+    static constexpr bool LocalSmallTile = Is_local && Varlen && !Is_FP8 && !Has_softcap
+        && Use_TMA_KV && CollectiveMainloop::kHeadDim == 64
+        && get<0>(TileShape_MNK_PV{}) == 64 && get<1>(TileShape_MNK_PV{}) == 64
+        && get<2>(TileShape_MNK_PV{}) == 64;
+    static constexpr uint32_t MinBlocksPerMultiprocessor = LocalSmallTile ? 2 : 1;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     /// Register requirement for Load and Math WGs
     // If we use cp.async to load K and V, we need more registers for the producer WG.
     static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 1 ? 56 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 24 : 40) : 32);
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    static constexpr uint32_t MmaRegisterRequirement = LocalSmallTile ? 160 : NumMmaWarpGroups == 1 ? 256 : (NumMmaWarpGroups == 2 ? (Use_TMA_KV ? 240 : 232) : 160);
+    // A warpgroup's setmaxnreg request is served from this CTA's register pool, whose size is
+    // (registers/thread granted at launch) * MaxThreadsPerBlock.  Under __launch_bounds__ ptxas
+    // rounds registers/thread DOWN to a multiple of 8 (and Hopper caps it at 255), so the pool can
+    // be smaller than 65536 / MinBlocksPerMultiprocessor.  When the combined request exceeds it,
+    // setmaxnreg compiles to a USETMAXREG.TRY_ALLOC retry loop that can never succeed: the kernel
+    // spins at 100% GPU forever with no diagnostic.  Catch it here instead of at runtime.
+    static constexpr uint32_t kRegsPerThreadBudget =
+        ((65536u / MinBlocksPerMultiprocessor / MaxThreadsPerBlock) > 255u
+             ? 255u
+             : (65536u / MinBlocksPerMultiprocessor / MaxThreadsPerBlock)) & ~7u;
+    static_assert(MmaRegisterRequirement * (NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup)
+                      + LoadRegisterRequirement * (NumLoadWarpGroups * cutlass::NumThreadsPerWarpGroup)
+                  <= kRegsPerThreadBudget * MaxThreadsPerBlock,
+                  "setmaxnreg request exceeds the CTA register pool: the kernel would hang.");
+
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
-    // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
+    // static constexpr uint32_t MmaRegisterRequirement = LocalSmallTile ? 160 : NumMmaWarpGroups == 2 ? 232 : 152;
 
     // Kernel level shared memory storage
     // We overlap the shared memory for the mainloop and epilogue. However, we only want smem_o to overlap with smem_v

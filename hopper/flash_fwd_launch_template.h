@@ -27,7 +27,7 @@ using namespace cute;
 
 template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element, typename ElementOut,
           bool Is_causal, bool Is_local, bool Has_softcap, bool Varlen, bool PagedKVNonTMA, bool AppendKV, bool HasQv,
-          bool PackGQA, bool Split, bool V_colmajor>
+          bool PackGQA, bool Split, bool V_colmajor, bool SmallLocal = false>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -37,7 +37,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using ArchTag = std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
     // Can't use structured binding since it's not compatible with constexpr
-    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap);
+    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, V_colmajor, PagedKVNonTMA, Has_softcap, SmallLocal);
     static constexpr std::tuple<int, int, int, int, bool> kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(Arch == 86 || Arch == 89, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element) /*element_size*/, PagedKVNonTMA, Varlen && Split, Has_softcap, AppendKV);
     static constexpr int kBlockM = Arch >= 90 ? std::get<0>(kBlockMN_RS_IntraWGOverlap) : std::get<0>(kBlockMN_kNWarps_Stages_RS);
     static constexpr int kBlockN = Arch >= 90 ? std::get<1>(kBlockMN_RS_IntraWGOverlap) : std::get<1>(kBlockMN_kNWarps_Stages_RS);
@@ -65,10 +65,11 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     // surface.  Note headdim_v needs its own guard: D=64 with dv=256/512 keeps kHeadDim at
     // 64 but selects a different (wider) tile.  D=128 happens to land exactly on the limit,
     // but it keeps the default tile and gains nothing from the extra stage.
-    static constexpr int kStages = Arch >= 90 ? (kHeadDim <= 64 && kHeadDimV <= 64 ? 3 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStagesDefault = Arch >= 90 ? (kHeadDim <= 64 && kHeadDimV <= 64 ? 3 : 2) : std::get<3>(kBlockMN_kNWarps_Stages_RS);
 #else
-    static constexpr int kStages = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
+    static constexpr int kStagesDefault = Arch >= 90 ? 2 : std::get<3>(kBlockMN_kNWarps_Stages_RS);
 #endif
+    static constexpr int kStages = SmallLocal ? 3 : kStagesDefault;
     static constexpr bool Q_in_regs = Arch >= 90 ? false : std::get<4>(kBlockMN_kNWarps_Stages_RS);
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
@@ -196,6 +197,8 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
+    // Dynamic scheduling offsets new work by gridDim.x, so the larger grid keeps tile ownership unique.
+    if constexpr (SmallLocal) { grid_dims.x *= 2; }
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
     // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
@@ -240,7 +243,14 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                         // Only use Cluster if number of tiles along seqlen_q is even and not varlen
                         CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
                             static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                            if constexpr (Arch == 90 && Is_local && Varlen && kHeadDim == 64 && kHeadDimV == 64
+                                          && cute::is_same_v<T, cutlass::bfloat16_t> && !Has_softcap && !PagedKVNonTMA && !AppendKV && !HasQv && !PackGQA && !Split) {
+                                BOOL_SWITCH(use_small_local_fwd(params), SmallLocal, [&] {
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, SmallLocal>(params, stream);
+                                });
+                            } else {
                             run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor>(params, stream);
+                            }
                         });
                     });
                 });

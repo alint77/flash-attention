@@ -169,6 +169,20 @@ struct Flash_fwd_params : public Qkv_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Keep host scheduler metadata and the compiled forward tile selection in sync.
+inline bool use_small_local_fwd(Flash_fwd_params const& params) {
+    return params.arch == 90 && params.is_bf16 && params.d == 64 && params.dv == 64
+        && params.is_local && !params.is_causal && params.softcap == 0.f
+        && params.h == params.h_k && params.cu_seqlens_q
+        && params.cu_seqlens_q == params.cu_seqlens_k
+        && !params.seqused_q && !params.seqused_k && !params.leftpad_k
+        && !params.page_table && !params.knew_ptr && !params.qv_ptr
+        && params.num_splits == 1 && params.attention_chunk == 0
+        && !params.skip_scheduler_metadata_computation
+        && params.window_size_left >= 0 && params.window_size_left <= 128
+        && params.window_size_right >= 0 && params.window_size_right <= 128;
+}
+
 struct Flash_bwd_params : public Flash_fwd_params {
     using index_t = int64_t;
 
