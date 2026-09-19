@@ -52,9 +52,22 @@ from 40 shards spread over all 1,750):
 | fraction > 192 | 42.0% | 40.9% |
 | max | 512 (dataset cap) | 2048 |
 
-Mean, std and CV agree within 1.5%. The one real difference is the tail: the corpus is capped at
-`max_seq_len: 512`, the synthetic has 2.3% beyond that. Long sequences are where this fork
-loses, so the benchmark is if anything slightly pessimistic.
+Mean, std and CV agree within 1.5%. The one real difference is the tail: that corpus is capped at
+`max_seq_len: 512` (a training-config choice, not a property of proteins — real UniRef sequences
+run past 2,000 residues), while the synthetic keeps 2.3% beyond 512.
+
+The tail cuts both ways, so it is worth being explicit about which direction:
+
+| | effect of the longer synthetic tail |
+|---|---|
+| forward | slightly **pessimistic** — the short-seq tile loses past ~1.5k, so the tail drags it down |
+| backward | slightly **optimistic** — empty-CTA waste scales with the *longest* sequence in the batch |
+
+Concretely, at `kBlockN=128`, packing 65,536 tokens: the synthetic batches launch 38-46k CTAs of
+which 72-76% are empty, while batches drawn from the 512-capped corpus launch 21-22k of which
+49-52% are empty. The real-tile count is the same either way (~10,750) because the token budget
+is fixed; only the launched count moves, and it is set entirely by the batch maximum. The
+end-to-end numbers in this document are unaffected — those runs train on the real corpus.
 
 Hardware: a single JUPITER **GH200** (Grace-Hopper, 132 SMs, 228 KB smem/SM, 680 W enforced
 cap, measured 3.64 TB/s HBM copy, ~605 TFLOP/s achieved bf16 GEMM), CUDA 13, PyTorch 2.12.
