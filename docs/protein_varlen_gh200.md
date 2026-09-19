@@ -35,18 +35,38 @@ Protein-LM regime: 65,536 tokens/pass, ~347 sequences, median length 163, mean 1
 (lognormal, UniRef-like), H=16, D=64, bf16, non-causal. Mean of 3 seeds, 60 timed iterations
 each after 20 warmup.
 
+### The benchmark length distribution, checked against real data
+
+Every benchmark here draws lengths from `clip(lognormal(mean=ln 170, sigma=0.55), 20, 2048)`.
+NumPy's `mean`/`sigma` are of the underlying normal, so that is median 170, mean 197.8, std 117.5.
+
+Checked against the corpus the end-to-end runs actually train on (52.5M sequences; 1.18M sampled
+from 40 shards spread over all 1,750):
+
+| | real corpus | synthetic benchmark |
+|---|---:|---:|
+| mean | 196.0 | 197.4 |
+| std | 118.5 | 117.7 |
+| median | 164 | 170 |
+| CV | 0.605 | 0.596 |
+| fraction > 192 | 42.0% | 40.9% |
+| max | 512 (dataset cap) | 2048 |
+
+Mean, std and CV agree within 1.5%. The one real difference is the tail: the corpus is capped at
+`max_seq_len: 512`, the synthetic has 2.3% beyond that. Long sequences are where this fork
+loses, so the benchmark is if anything slightly pessimistic.
+
 Hardware: a single JUPITER **GH200** (Grace-Hopper, 132 SMs, 228 KB smem/SM, 680 W enforced
 cap, measured 3.64 TB/s HBM copy, ~605 TFLOP/s achieved bf16 GEMM), CUDA 13, PyTorch 2.12.
 That is a machine balance of **~166 FLOP/byte**, against ~250 for an H100 SXM — the 680 W cap
 is a ~24% compute derate with no bandwidth penalty, leaving the part ~35% more bandwidth-rich
 per FLOP.
 
-> **The original hypothesis, and why it was wrong.** This investigation started from the
-> observation that `hopper/tile_size.h` is commented *"benchmarked on H100 SXM"*, and the guess
-> that a machine with a ~35% different compute/bandwidth ratio would want a different tile.
-> **It does not.** At seqlen 8192, 37 configurations were swept on GH200 and none beat the H100
-> table, because FA3 sits at ~97% of the achievable GEMM ceiling there — there is no roofline
-> headroom to exploit. The gains documented below are *workload-shape* effects (tile
+> **The original hypothesis, and why it was wrong.** This started from the guess that the
+> GH200's lower FLOP/byte ratio would shift FA3's optimal tile shapes. **It does not.** At long
+> sequence length FA3 already runs at ~92% of this machine's achieved bf16 GEMM ceiling (558 of
+> 605 TFLOP/s, measured at D=128 causal, seqlen 8192), so there is no roofline headroom to
+> exploit. The gains documented below are *workload-shape* effects (tile
 > quantization and empty CTAs on short ragged sequences), not hardware-balance effects, and
 > would likely reproduce on an H100. No H100 control was available, so **nothing in this
 > document is claimed as GH200-specific.**
@@ -86,6 +106,36 @@ TFLOP/s  152.5  167.9  173.7  177.2  175.1  172.4  171.9  161.3  148.8
 
 `IntraWGOverlap=false` wins everywhere (+1 to +7 TF/s), `tile_m` 192 > 128 > 64
 (175 / 168 / 143), and `kStages` 3 > 4 > 2 (~+1.5 TF/s).
+
+### Ablating the three knobs
+
+The flag changes three things at once. Each measured separately, forward-only D=64 builds,
+protein regime, 2 reps x 3 seeds interleaved on one GPU:
+
+| build | tile | IntraWGOverlap | kStages | TFLOP/s | vs upstream |
+|---|---|---|---:|---:|---:|
+| upstream | 192x192 | true | 2 | 149.3 | - |
+| fork (shipped) | 192x80 | false | 3 | **184.8** | **+23.8%** |
+| same tile, overlap on | 192x80 | true | 3 | 183.2 | +22.7% |
+
+`IntraWGOverlap=false` is worth **+0.87%** on its own, so the shipped setting is the better one.
+The tile change carries the rest; `kStages` 3 over 2 is ~+1.5 TF/s per the per-axis sweep above.
+
+### What tile quantization does and does not explain
+
+Wasted score entries are computable from the length distribution alone:
+`sum(ceil(L/M)*M * ceil(L/N)*N)` against `sum(L^2)`. On the real corpus:
+
+| tile_n | 32 | 64 | 80 | 128 | 192 |
+|---|---:|---:|---:|---:|---:|
+| quantization efficiency | 69.4% | 65.3% | 63.7% | 59.2% | 51.8% |
+| measured TFLOP/s | 152.5 | 173.7 | **177.2** | 171.9 | 148.8 |
+
+Quantization improves monotonically as the tile narrows, so it predicts an optimum at 32; the
+measurement peaks at 80 and falls off below it (Pearson r = 0.29 across the range). It accounts
+for the direction of the 192 -> 80 move, and overstates its size (+22.9% modelled against +19.1%
+measured at fixed stages and overlap). Below ~80 a per-iteration cost dominates. The optimum is
+where the two cross, which is why it has to be found empirically.
 
 The mechanism is **scheduler load balance across ragged sequences**, not padding arithmetic:
 `tile_n` 64, 96 and 192 pad a median-169 sequence identically, yet differ by 25 TF/s.

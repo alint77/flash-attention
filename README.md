@@ -183,10 +183,9 @@ nodes carry four GH200 Grace-Hopper superchips. Measured on one of them:
 | SMs / smem per SM | 132 / 228 KB | 132 / 228 KB |
 
 The 680 W cap is a ~24% compute derate with no bandwidth penalty, which leaves the GH200
-roughly **35% more bandwidth-rich per FLOP** than an H100. Upstream's forward tile table in
-`hopper/tile_size.h` carries the comment *"benchmarked on H100 SXM"*. The starting hypothesis
-was that a machine with a materially different compute/bandwidth ratio should prefer a
-different tile shape.
+roughly **35% more bandwidth-rich per FLOP** than an H100. The starting hypothesis was that a machine with a materially different compute/bandwidth ratio
+should prefer a different tile shape. It does not — see the falsified-hypothesis note in
+[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md).
 
 **That hypothesis was falsified, and it is worth saying so plainly.** At seqlen 8192 the H100
 table is already optimal on GH200 — 37 configurations were swept and nothing beat it — because
