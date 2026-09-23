@@ -12,8 +12,10 @@ regression rather than a win.
 2. [Part 1 — Short-sequence forward tiles (opt-in)](#part-1--short-sequence-forward-tiles-opt-in)
 3. [Part 2 — Persistent backward scheduler (default on)](#part-2--persistent-backward-scheduler-default-on)
 4. [Part 3 — Operating range: when this helps and when it hurts](#part-3--operating-range-when-this-helps-and-when-it-hurts)
-5. [Status and limitations](#status-and-limitations)
-6. [Reproducing](#reproducing)
+5. [Part 4 — Sliding-window (local) attention](#part-4--sliding-window-local-attention)
+6. [Part 5 — What else was tried, and where the time goes now](#part-5--what-else-was-tried-and-where-the-time-goes-now)
+7. [Status and limitations](#status-and-limitations)
+8. [Reproducing](#reproducing)
 
 
 ## Summary
@@ -770,6 +772,80 @@ of this sliding configuration. No forward-only training speedup is established.
 Run `python docs/analyze_sliding_window_e2e.py` from the repo root (requires NumPy) to regenerate
 the table and standard errors from [the 24 saved run medians](data/sliding_window_e2e_runs.json).
 
+## Part 5 — What else was tried, and where the time goes now
+
+All numbers below use batches of real nanoPLM lengths (1.8M sequences from 60 of 1,753 shards,
+picked with `np.random.default_rng(123).choice(1753, 60, replace=False)` over the sorted
+`*.idx.npy` list; max 512) as well as the synthetic distribution. 65,536 tokens per pass, D=64, H=16.
+
+### Forward tile, re-checked on real lengths: no change
+
+The 192×80 tile was picked on synthetic lengths. Re-swept on real lengths (4 seeds × 2 reps,
+order reversed on the second rep), it is still the fastest:
+
+| tile | real TF/s | vs shipped | synthetic TF/s | vs shipped |
+|---|---:|---:|---:|---:|
+| **192×80 (shipped)** | **186.5** | — | **185.3** | — |
+| 128×80 | 185.1 | +0.8% time | 179.9 | +3.0% |
+| 192×64 | 184.7 | +1.0% | 184.0 | +0.7% |
+| 128×128 | 179.0 | +4.2% | 171.5 | +8.1% |
+| upstream 192×192 | 150.2 | +24.1% | 150.3 | +23.3% |
+
+128-row tiles pad real data less (1.23× vs 1.36×) and still lose, because they need more tiles
+per sequence. The synthetic benchmark picked the same winner as real data.
+
+### Backward 64×128 tile for the general launch: dropped
+
+64-row tiles pad the 257–512 bucket less (1.28× vs 1.40×). Replacing the general 128×128 tile
+gave −2.5% backward on real lengths (12 paired runs, range −3.4 to −1.6%), but it loses
+whenever padding is equal:
+
+| fixed length | 128 | 256 | 384 | 512 | 1024 | 4096 | 8192 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 64×128 vs 128×128 | **−12.3%** | +0.4% (fast tile, unchanged) | +3.6% | +4.0% | +5.9% | +8.5% | +9.3% |
+
+Splitting by length into three launches cost more than it saved: each extra main launch plus
+postprocess costs ~50 µs (~5% of the backward). A host-side `max_seqlen <= 512` gate would keep
+−2.5% on nanoPLM, but that is ≈ −0.14% of step time, below end-to-end noise. Not shipped.
+A 64×64 tile faults on L>64 in both this fork and the pre-fork build.
+
+### Where the backward time goes (nsys, real lengths)
+
+| kernel | µs | share |
+|---|---:|---:|
+| main, 128×128 (L≤128 and L>256) | 560 | 55% |
+| main, 32×256 (129–256) | 263 | 26% |
+| preprocess | 125 | 12% |
+| postprocess | 69 | 7% |
+
+Preprocess and postprocess are at 81% and 75% of DRAM bandwidth (floors 115 and 56 µs for the
+bytes they move). They can only get faster by moving less data.
+
+### What limits each kernel (Nsight Compute, real lengths)
+
+| kernel | tensor pipe | XU (exp2) | FMA | warps active | dominant stalls |
+|---|---:|---:|---:|---:|---|
+| forward 192×80 | 36% | 39% | 18% | 20% | barrier/wait 38%, waiting on wgmma 16% |
+| backward 32×256 | 30% | — | — | 16% | barrier, branch on global load |
+| backward 128×128 | 42% | — | — | 16% | long scoreboard 21%, barrier 20% |
+
+No pipe is saturated. Math-pipe throttle is 2.7% of forward stalls, so MUFU throughput is not the
+limit and FA4's exp2 emulation would buy little here. Both passes are latency-bound on
+warpgroup synchronization. That is consistent with the overlap ablation in Part 1 (an 80-wide
+softmax may be too short to hide a GEMM behind), though only the overlap-off build was profiled.
+
+### Remaining levers
+
+| lever | targets | ceiling | cost |
+|---|---|---|---|
+| Compute delta in-kernel for L≤256 (dQ accumulate/convert is already skipped there, Part 2b) | the O·dO read in preprocess | ~−2% backward (net of the O read moving into the main kernel) | changes 2 kernels |
+| Remove preprocess entirely (delta per n-block, clear dq_accum elsewhere) | preprocess, 12% of backward | < −12% backward, minus extra O traffic | needs a race-free dq_accum clear |
+| 2 CTAs/SM forward (smaller register budget, as in the SWA path) | forward sync stalls | unknown | tile alone regressed for SWA |
+| exp2 → FMA polynomial | forward MUFU stalls (18% of samples) | a few % | changes output bits |
+
+None is low-hanging. Attention was measured at 7.8% of a nanoPLM step (all-full config), so
+each is worth well under 1% end to end.
+
 ## Status and limitations
 
 * The backward persistent scheduler requires `Arch >= 90 && Varlen && !Is_causal && !GQA &&
@@ -783,10 +859,13 @@ the table and standard errors from [the 24 saved run medians](data/sliding_windo
   tile count. Obtaining that metadata and selecting kernels has costs that must be measured.
   A fill threshold near 0.5 remains unvalidated; fill alone also does not capture the benefit
   of direct dQ stores on short uniform sequences. Adaptive dispatch is not implemented here.
-* The empty-tile path under the persistent scheduler is nearly unreachable by construction
-  (per-batch block counts are exact), so `store_zero()` is effectively dead code there. It is
-  left in place and the credit accounting handles it, but it is **not** covered by the tests
-  above.
+* The empty-tile path under the persistent scheduler **is reachable**. When a batch's longest
+  sequence fits in one KV block, the scheduler skips the per-sequence length lookup and gives
+  every sequence one tile, including sequences the partition assigned to the other launch.
+  A batch with every sequence ≤128 walks 8,192 empty tiles in the 32×256 launch (~60 µs).
+  On such batches (618 sequences, max length ≤128 or ≤256) gradients match FP32 SDPA to
+  bf16 level (max abs error ~0.006), and on 720 sequences they are bit-identical to the pre-SWA
+  build, so the SWA changes did not alter this path. Real nanoPLM batches (max ~500) never take it.
 * Deterministic mode, GQA, split-KV and paged KV are untouched and still use the stock path.
 * The direct dQ store adds a second main-kernel launch and a device partition kernel, and
   mutates `params.seqused_*` across the two `run_flash_bwd` calls. On all-long workloads the
