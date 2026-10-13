@@ -1033,11 +1033,15 @@ touch instantiations/*.cu *.cpp
 ## Disclosure
 
 The changes, benchmarks, profiling and this document were produced with
-[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** at high reasoning
-effort, on the JUPITER cluster, under the repository owner's direction and review.
+[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** and later **Claude Opus
+5.5** at high reasoning effort, on the JUPITER cluster, under the repository owner's direction
+and review.
 
-Subsequent review corrections, regression tests, and the reproducible training-table analysis
-were added with Codex.
+Review corrections, regression tests, and the reproducible training-table analysis were added
+with Codex, latterly **GPT-6 Astra**. The contract gates of Part 6 were written with Opus 5.5
+and then reviewed adversarially by GPT-6 Astra, whose findings are recorded in that section:
+six were defects in the gates themselves and are fixed, and the gaps it left open are listed
+rather than dropped.
 
 Kernel timings are from GH200 runs; the training tables report fits to recorded run medians.
 Upstream's selected tests retain baseline outcomes across the five compiled head dimensions,

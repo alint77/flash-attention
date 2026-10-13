@@ -211,12 +211,14 @@ python setup.py install
 ### Disclosure
 
 This fork's changes, benchmarks, profiling and documentation were produced with
-[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** at high reasoning
-effort, working on the JUPITER cluster under my direction and review. Every performance number
-in this README and in `docs/` is from an actual run on a GH200 — nothing is estimated or
-extrapolated. Correctness claims are backed by gradient checks against per-sequence PyTorch
-SDPA and by end-to-end training runs; the specific checks and their limits are listed in
-[docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md).
+[Claude Code](https://claude.com/claude-code) running **Claude Opus 5** and later **Claude Opus
+5.5** at high reasoning effort, working on the JUPITER cluster under my direction and review,
+with adversarial review by **GPT-6 Astra** (Codex). Every performance number in this README and
+in `docs/` is from an actual run on a GH200 — nothing is estimated or extrapolated. Correctness
+claims are backed by gradient checks against per-sequence PyTorch SDPA, by end-to-end training
+runs, and by the contract gates in `hopper/test_contracts_varlen.py`, which also run against
+pristine upstream and against deliberately broken builds; the specific checks and their limits
+are listed in [docs/protein_varlen_gh200.md](docs/protein_varlen_gh200.md).
 
 ---
 
