@@ -846,6 +846,69 @@ softmax may be too short to hide a GEMM behind), though only the overlap-off bui
 None is low-hanging. Attention was measured at 7.8% of a nanoPLM step (all-full config), so
 each is worth well under 1% end to end.
 
+## Part 6 — Contract gates: what the correctness claim rests on
+
+`hopper/test_contracts_varlen.py` asks the questions a loose "close to a reference at one
+shape" check cannot. Most gates need no tolerance: they compare bits, exact non-finite masks,
+or which kernel ran. Run on 2026-10-13 against two trees — the merge-base `0251105a2f` as
+pristine upstream, and HEAD with `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` as the shipped config.
+
+**The dispatch is proved, not assumed.** Every fast path is gated on Q and K sharing one
+`cu_seqlens` *pointer* with no `seqused` (`flash_bwd_launch_template.h:64`, `flash.h:173`), so a
+caller passing two equal-valued tensors silently gets upstream's kernel. Each gate reads the
+launched kernel names back from the profiler and asserts the tile shape, so no test can pass by
+having quietly measured upstream.
+
+| gate | property | tolerance |
+|---|---|---|
+| path proof | forward 192×80; local 64×64 inside the `use_small_local_fwd` window and 192×128 outside it; backward 32×256 + 128×128 with the partition kernel; a cloned `cu_seqlens_k` falls back to 128×128 | none |
+| cross-sequence isolation | change or NaN one packed sequence: every other sequence's `out`, `lse`, dK, dV stays bit-identical | none |
+| non-finite direction | a NaN never reaches a *later* sequence (every victim, 11 cases) | none |
+| repeatability | 5 identical calls: `out`, `lse`, dK, dV bit-identical; dQ spread recorded | none / measured |
+| poisoned destinations | gradient buffers refilled with NaN, −1e4 and 7.5 and reused: no sentinel survives, results unchanged | 1e-2 |
+| shared scratch | alternating short and long batches agree with their own single-shape runs | 1e-2 |
+| values | `out`, `lse`, dQ, dK, dV against a per-sequence float64 reference, 5 windows, lengths across the 128/256 split | 1e-2 / 2e-2 |
+
+**Fork against upstream.** The claim is "faster, not different", so the load-bearing comparison
+is relative. Max error against the same float64 reference on the 12-length ragged batch:
+
+| tensor | upstream | fork |
+|---|---:|---:|
+| out | 2.67e−3 | 2.67e−3 |
+| lse | 9.6e−7 | 9.9e−7 |
+| dQ | 5.71e−3 | 5.71e−3 |
+| dK | 4.72e−3 | 4.70e−3 |
+| dV | 5.57e−3 | 5.57e−3 |
+
+Over 7 windows × 5 tensors the fork is never worse than upstream beyond rounding. Two inherited
+properties are worth naming.
+
+* **Non-finite read-ahead is upstream behaviour, and the fork narrows it.** A KV tile at the end
+  of sequence *i* covers rows of sequence *i+1*; the mask is additive, so a NaN there survives
+  and contaminates the *earlier* sequence. Upstream and the fork agree on 19 of 21 poisoning
+  cases; in the other 2 the fork reaches **fewer** sequences, its KV tile being narrower. It
+  never travels forward, which is what the gate enforces.
+* **dQ is steadier than upstream's.** Run-to-run spread on identical inputs: upstream 4.9e−4,
+  fork 3.1e−5, because direct stores replace most of the atomic accumulation. The forward, dK
+  and dV are bit-identical across runs in both.
+
+**The suite is checked against deliberate bugs.** Three one-line mutants of HEAD:
+
+| mutant | injected defect | caught by |
+|---|---|---:|
+| `m_dqoff` | direct dQ store one row too far | 7 gate groups, 20 cases |
+| `m_dqskip` | one dQ store in eight dropped | 6 groups, 11 cases |
+| `m_floor` | scheduler drops each partial tail tile | 8 groups, 16 cases |
+
+All three still pass every path gate, so the mutated code did run: the failures are detections,
+not a dead branch. On pristine upstream the suite fails **only** the 6 path-proof cases and
+passes all 29 behaviour gates, so the path gates do detect the fork's paths and the behaviour
+gates are not shaped around it.
+
+Not covered here: FP16 (disabled in this build), causal, GQA, softcap, split and paged KV, head
+dimensions other than 64, `dv != d`, and deterministic mode, which disables both fast paths by
+design. The upstream suite covers those; see Status below.
+
 ## Status and limitations
 
 * The backward persistent scheduler requires `Arch >= 90 && Varlen && !Is_causal && !GQA &&
@@ -883,6 +946,10 @@ each is worth well under 1% end to end.
 * `hopper/test_flash_attn_local_varlen.py` tests shared-pointer self-attention, partition and
   window boundaries, fallback calls, and scheduler-metadata reuse against FP32. Both BF16 and
   FP16 are parametrized, but the audit's FP16-disabled build cannot validate that dtype.
+* `hopper/test_contracts_varlen.py` (Part 6) adds the tolerance-free gates: which kernel ran,
+  isolation between packed sequences, non-finite direction, repeatability, and poisoned
+  destination buffers. It needs a build with `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE`; without
+  that flag the forward path gate fails, by design, since the forward would be upstream's.
 
 ## Reproducing
 
