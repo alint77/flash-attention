@@ -853,6 +853,26 @@ shape" check cannot. Most gates need no tolerance: they compare bits, exact non-
 or which kernel ran. Run on 2026-10-13 against two trees — the merge-base `0251105a2f` as
 pristine upstream, and HEAD with `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` as the shipped config.
 
+The approach is borrowed, and the debt is worth stating plainly. Shah and Shrestha's
+*A Contract-Grade Verifier for LLM-Generated GPU Kernels, and a Native Blackwell Backward for
+the Gated-Linear-Recurrence Family* (preprint, 2026; code at
+<https://github.com/RishiShah99/lethe>) audits 2,638 machine-generated kernels that a public
+system's own harness had already accepted and finds 39.5% broken in a way no tolerance excuses,
+with a swallowed NaN or infinity as the most common defect. It operationalises the Kernel
+Contracts taxonomy of Veit, *Kernel Contracts: A Specification Language for ML Kernel
+Correctness Across Heterogeneous Silicon* (arXiv:2604.22032, 2026). Four ideas are taken from
+them directly: that the load-bearing gates should be *tolerance-free*, that non-finite
+propagation, determinism and shape polymorphism are the three cheapest such gates, that a
+reference must be graded in higher precision than the candidate, and that a verifier is worth
+nothing until a red team of deliberately broken kernels shows it can reject them.
+
+Two things here differ from that paper. Its audit judges kernels in absolute terms against a
+PyTorch reference; this suite's load-bearing comparison is *relative*, against upstream FA3 at
+the exact commit the fork branched from, because the claim being tested is "faster, not
+different" rather than "correct from first principles". And one gate they would count as a
+failure is inherited: FA3 varlen does not propagate non-finites across packed-sequence
+boundaries the way a per-sequence reference does (see below), identically in upstream and here.
+
 **The dispatch is pinned down, not assumed.** Every fast path is gated on Q and K sharing one
 `cu_seqlens` *pointer* with no `seqused` (`flash_bwd_launch_template.h:64`, `flash.h:173`), so a
 caller passing two equal-valued tensors silently gets upstream's kernel. The path gates read the

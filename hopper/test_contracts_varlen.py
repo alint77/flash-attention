@@ -4,6 +4,17 @@ These tests check properties a correct kernel must have, independent of any
 tolerance where that is possible: which code path ran, isolation between the
 packed sequences, no stale or missing writes, and run-to-run stability.
 
+The design follows Shah and Shrestha, "A Contract-Grade Verifier for
+LLM-Generated GPU Kernels, and a Native Blackwell Backward for the
+Gated-Linear-Recurrence Family" (preprint, 2026; https://github.com/RishiShah99/lethe),
+which operationalises the Kernel Contracts taxonomy of Veit (arXiv:2604.22032,
+2026): prefer gates no tolerance can explain away, grade against a
+higher-precision reference, and keep a red team of deliberately broken builds so
+that a passing suite means something. Here the load-bearing comparison is
+relative, against upstream FA3 at the commit this fork branched from, since the
+claim under test is "faster, not different"; see docs/protein_varlen_gh200.md
+Part 6 for the measured numbers and the gaps that remain.
+
 The fast paths are only selected when Q and K share one cu_seqlens object and
 seqused is absent (flash_bwd_launch_template.h), so a caller that passes two
 equal-valued tensors silently gets upstream's kernel. The gates under "path
