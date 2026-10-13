@@ -5,8 +5,12 @@ tolerance where that is possible: which code path ran, isolation between the
 packed sequences, no stale or missing writes, and run-to-run stability.
 
 The fast paths are only selected when Q and K share one cu_seqlens object and
-seqused is absent (flash_bwd_launch_template.h), so every gate first proves
-which path it exercised instead of assuming it.
+seqused is absent (flash_bwd_launch_template.h), so a caller that passes two
+equal-valued tensors silently gets upstream's kernel. The gates under "path
+proof" below pin that dispatch down by reading the launched kernel names back.
+They establish which specialization ran for a given call shape; they do not
+prove which sequences or tiles it processed, and the value gates do not re-check
+their own dispatch. Tile-visit accounting would need a debug build.
 
 Run with the FLASH_ATTENTION_DISABLE_* settings used to build the extension:
     PYTHONPATH=<built tree>/hopper pytest -q test_contracts_varlen.py
@@ -202,99 +206,142 @@ def test_path_local_uses_the_local_fast_tiles():
     assert path["tiles"] == [(32, 256), (64, 128)], path
 
 
-def test_path_every_length_bucket_is_covered():
-    """Lengths either side of the 128/256 split still select both arms."""
-    for lengths in ([128, 129], [256, 257], [1, 128, 129, 256, 257, 512]):
-        path = _path_of(lengths)
-        assert path["partition"], (lengths, path)
-        assert (32, 256) in path["tiles"] or max(lengths) <= 128, (lengths, path)
+# The device-side partition sends 128 < len <= 256 to the 32x256 direct-dQ arm
+# and everything else to the 128x128 arm, so these three batches put work in one
+# arm, the other, or both (partition_backward_lengths in
+# flash_bwd_launch_template.h). An all-rest batch also leaves the fast arm with
+# no work at all, which is its own case.
+ALL_FAST = [129, 200, 256]
+ALL_REST = [64, 300, 512]
+BOTH_ARMS = [64, 129, 300]
+
+
+@pytest.mark.parametrize("lengths", [
+    ALL_FAST, ALL_REST, BOTH_ARMS,
+    [128, 129],     # either side of the lower split
+    [256, 257],     # either side of the upper split
+    [128], [257], [1],
+])
+def test_path_both_backward_arms_always_launch(lengths):
+    """Both launches happen for every batch, even when one bucket is empty.
+
+    The partition writes zeros into the `seqused` array it hands each arm, so an
+    arm with no work still launches and walks empty tiles rather than being
+    skipped on the host. That makes the launch cost fixed, and it also means
+    kernel names cannot show *which* sequences an arm processed: this gate is
+    dispatch only. Proving that every sequence lands in exactly one arm exactly
+    once needs per-tile visit counting in a debug build, which this suite does
+    not have (see docs/protein_varlen_gh200.md Part 6).
+    """
+    path = _path_of(lengths)
+    assert path["partition"], (lengths, path)
+    assert path["tiles"] == [(32, 256), (128, 128)], (lengths, path)
 
 
 # ------------------------------------------------------------- repeatability
 
 
 LENGTHS = [0, 1, 63, 64, 65, 127, 128, 129, 255, 256, 257, 512]
+# Around the new 80-column KV tile and the 192-row Q tile, and their multiples.
+TILE_EDGES = [79, 80, 81, 159, 160, 161, 191, 192, 193, 239, 240, 320, 400]
+SEEDS = (1729, 20261013, 7)
+
+# What each output is expected to do across identical runs. This is fixed by the
+# design, not inferred from the run: dK and dV have one owner per element, the
+# forward reduces in a fixed order, and dQ is the only output that can still be
+# summed over n-blocks with atomics (mainloop_bwd_sm90_tma_gmma_ws.hpp:983).
+EXACT = ("out", "lse", "dk", "dv")
+APPROXIMATE = ("dq",)
 
 
-def _stability(lengths, window=(-1, -1), repeats=5):
-    """Which outputs are bit-identical across repeated identical calls."""
-    inputs = _inputs(lengths)
-    first = _run(lengths, window, inputs=inputs)
-    stable = {name: True for name in first}
-    spread = {name: 0.0 for name in first}
-    for _ in range(repeats - 1):
-        again = _run(lengths, window, inputs=inputs)
-        for name, value in again.items():
-            same = torch.equal(value, first[name])
-            stable[name] &= same
-            if not same:
-                delta = (value.float() - first[name].float()).abs().max().item()
-                spread[name] = max(spread[name], delta)
-    return stable, spread
+def _stability(lengths, window=(-1, -1), repeats=5, seed=1729):
+    """Max run-to-run movement of each output over every pair of repeats."""
+    inputs = _inputs(lengths, seed=seed)
+    runs = [_run(lengths, window, inputs=inputs) for _ in range(repeats)]
+    for run in runs:
+        for name, value in run.items():
+            assert torch.isfinite(value).all(), f"{name} is not finite"
+    spread = {}
+    for name in runs[0]:
+        worst = 0.0
+        for later in runs[1:]:
+            if not torch.equal(later[name], runs[0][name]):
+                worst = max(worst, (later[name].double()
+                                    - runs[0][name].double()).abs().max().item())
+        spread[name] = worst
+    return spread
 
 
 @pytest.mark.parametrize("window", [(-1, -1), (64, 64)])
-def test_forward_and_dkv_are_bit_identical_across_runs(window):
+@pytest.mark.parametrize("lengths", [LENGTHS, ALL_FAST, ALL_REST])
+def test_forward_and_dkv_are_bit_identical_across_runs(window, lengths):
     """The forward and dK/dV reduce in a fixed order, so bits must not move."""
-    stable, spread = _stability(LENGTHS, window)
-    for name in ("out", "lse", "dk", "dv"):
-        assert stable[name], (name, spread[name])
+    spread = _stability(lengths, window)
+    for name in EXACT:
+        assert spread[name] == 0.0, (name, spread[name])
 
 
-def test_dq_run_to_run_spread_is_recorded():
-    """dQ accumulates over n-blocks, so document its spread rather than assume."""
-    stable, spread = _stability(LENGTHS)
-    # Not an assertion about bits: a regression here is a jump in magnitude.
-    assert spread["dq"] < 1e-2, spread["dq"]
+def test_dq_spread_stays_small():
+    """dQ can be summed over n-blocks, so bound its movement instead of its bits.
+
+    Upstream FA3 shows 4.9e-4 here and the fork about 1e-6, because direct
+    stores replace most of the atomic accumulation; xbuild_compare.py is what
+    holds the fork to upstream's figure. This bound only catches a blow-up.
+    """
+    assert _stability(LENGTHS)["dq"] < 1e-2
 
 
 # ----------------------------------------------------- cross-sequence isolation
 
 
-def _isolate(lengths, index, poison, window=(-1, -1)):
-    """Change one sequence; return per-tensor max change on the others."""
-    inputs = _inputs(lengths)
+def _isolate(lengths, index, which, window=(-1, -1), seed=1729):
+    """Change one sequence's `which` inputs; max change on the other sequences."""
+    inputs = _inputs(lengths, seed=seed)
     base = _run(lengths, window, inputs=inputs)
-    stable, _ = _stability(lengths, window, repeats=3)
 
     start = sum(lengths[:index])
     end = start + lengths[index]
     perturbed = [t.clone() for t in inputs]
-    for tensor in perturbed[:3] if poison is None else perturbed:
-        tensor[start:end] = (
-            torch.randn_like(tensor[start:end]) if poison is None else poison
-        )
+    for slot in which:
+        perturbed[slot][start:end] = torch.randn_like(perturbed[slot][start:end])
     after = _run(lengths, window, inputs=perturbed)
 
-    rows = {"out": slice(None), "dq": slice(None), "dk": slice(None),
-            "dv": slice(None), "lse": slice(None)}
     deltas = {}
     for name, value in after.items():
-        a, b = base[name].float(), value.float()
-        if name == "lse":
-            a, b = a[:, :], b[:, :]
-            keep = torch.ones(a.shape[-1], dtype=torch.bool, device=a.device)
-            keep[start:end] = False
-            a, b = a[:, keep], b[:, keep]
-        else:
-            keep = torch.ones(a.shape[0], dtype=torch.bool, device=a.device)
-            keep[start:end] = False
-            a, b = a[keep], b[keep]
+        a, b = base[name].double(), value.double()
+        assert torch.isfinite(b).all(), f"{name} went non-finite"
+        axis = -1 if name == "lse" else 0
+        keep = torch.ones(a.shape[axis], dtype=torch.bool, device=a.device)
+        keep[start:end] = False
+        a, b = (a[..., keep], b[..., keep]) if name == "lse" else (a[keep], b[keep])
         deltas[name] = (a - b).abs().max().item() if a.numel() else 0.0
-        assert torch.isfinite(b).all(), f"{name} went non-finite outside sequence {index}"
-    del rows
-    return deltas, stable
+    return deltas
 
 
-@pytest.mark.parametrize("index", [0, 5, 11])
-def test_other_sequences_are_untouched_by_a_finite_change(index):
-    lengths = LENGTHS
-    deltas, stable = _isolate(lengths, index, poison=None)
-    for name, delta in deltas.items():
-        if stable[name]:
-            assert delta == 0.0, (name, delta)
-        else:
-            assert delta < 1e-2, (name, delta)
+# Sequence 7 of LENGTHS is 129 long, so it is the one victim that belongs to the
+# direct-dQ arm; 5 and 11 are rest-arm victims and 1 is a single token.
+@pytest.mark.parametrize("index", [1, 5, 7, 11])
+@pytest.mark.parametrize("which,label", [((0, 1, 2), "qkv"), ((3,), "dout")])
+def test_other_sequences_are_untouched_by_a_finite_change(index, which, label):
+    """Tolerance-free isolation: the expectation is fixed, not read off the run.
+
+    dQ is allowed to move because its n-block sum can reorder; everything else
+    has one owner per element and must not move a bit.
+    """
+    deltas = _isolate(LENGTHS, index, which)
+    for name in EXACT:
+        assert deltas[name] == 0.0, (label, name, deltas[name])
+    for name in APPROXIMATE:
+        assert deltas[name] < 1e-2, (label, name, deltas[name])
+
+
+@pytest.mark.parametrize("lengths", [ALL_FAST, ALL_REST, BOTH_ARMS])
+def test_isolation_holds_within_each_arm(lengths):
+    """Both backward arms, and a batch that splits across the two."""
+    for index in range(len(lengths)):
+        deltas = _isolate(lengths, index, (0, 1, 2))
+        for name in EXACT:
+            assert deltas[name] == 0.0, (lengths, index, name, deltas[name])
 
 
 @pytest.mark.parametrize("victim", range(1, len(LENGTHS)))
@@ -370,26 +417,57 @@ def _fp64_reference(lengths, window, tensors):
 BOUNDS = {"out": 1.0e-2, "lse": 1.0e-4, "dq": 2.0e-2, "dk": 2.0e-2, "dv": 2.0e-2}
 
 
-@pytest.mark.parametrize("window", [(-1, -1), (0, 0), (64, 64), (16, 48), (-1, 64)])
-def test_values_against_a_float64_reference(window):
-    lengths = LENGTHS
-    tensors = _inputs(lengths)
+def _check_values(lengths, window, seed=1729):
+    """Compare against float64 built from inputs snapshotted *before* the call.
+
+    Taking the snapshot first matters: a kernel or wrapper that modified its own
+    input would otherwise be graded against the modified input and agree with
+    itself. The snapshot doubles as an immutability check.
+    """
+    tensors = _inputs(lengths, seed=seed)
+    before = [t.clone() for t in tensors]
     got = _run(lengths, window, inputs=tensors)
-    want = _fp64_reference(lengths, window, tensors)
+    for name, (now, then) in zip(("q", "k", "v", "dout"), zip(tensors, before)):
+        assert torch.equal(now, then), f"the call modified its own {name}"
+    want = _fp64_reference(lengths, window, before)
+    errors = {name: (got[name].double() - want[name]).abs().max().item()
+              for name in BOUNDS}
     for name, bound in BOUNDS.items():
-        error = (got[name].double() - want[name]).abs().max().item()
-        assert error < bound, (name, error, bound)
+        assert errors[name] < bound, (lengths, window, name, errors[name], bound)
+    return errors
 
 
-def test_values_hold_at_the_length_split_boundaries():
-    """The backward splits the batch by length, so check either side of it."""
-    for lengths in ([127, 128, 129], [255, 256, 257], [1, 2, 3], [512, 1, 512]):
-        tensors = _inputs(lengths)
-        got = _run(lengths, (-1, -1), inputs=tensors)
-        want = _fp64_reference(lengths, (-1, -1), tensors)
-        for name, bound in BOUNDS.items():
-            error = (got[name].double() - want[name]).abs().max().item()
-            assert error < bound, (lengths, name, error, bound)
+@pytest.mark.parametrize("window", [(-1, -1), (0, 0), (64, 64), (16, 48), (-1, 64)])
+@pytest.mark.parametrize("seed", SEEDS)
+def test_values_against_a_float64_reference(window, seed):
+    _check_values(LENGTHS, window, seed)
+
+
+@pytest.mark.parametrize("lengths", [
+    [127, 128, 129], [255, 256, 257], [1, 2, 3], [512, 1, 512],
+    ALL_FAST, ALL_REST, BOTH_ARMS, TILE_EDGES,
+])
+def test_values_hold_at_every_boundary(lengths):
+    """Either side of the length split, and around the 80 and 192 tile edges."""
+    _check_values(lengths, (-1, -1))
+    _check_values(lengths, (64, 64))
+
+
+@pytest.mark.parametrize("lengths", [LENGTHS, ALL_FAST, ALL_REST])
+def test_a_zero_window_has_an_exact_answer(lengths):
+    """With window (0, 0) each query attends to itself alone.
+
+    Then out == V, dV == dout and dQ == dK == 0 exactly, with no reduction to
+    reorder and no softmax to approximate, so this needs no tolerance at all.
+    """
+    tensors = _inputs(lengths)
+    q, k, v, do = tensors
+    got = _run(lengths, (0, 0), inputs=tensors)
+    assert torch.equal(got["out"], v), "out should be V"
+    assert torch.equal(got["dv"], do), "dV should be dout"
+    for name in ("dq", "dk"):
+        worst = got[name].double().abs().max().item()
+        assert worst < 1e-5, (name, worst)
 
 
 # ------------------------------------------------------------ stale and missing
@@ -399,16 +477,17 @@ SENTINELS = [float("nan"), -1.0e4, 7.5]
 
 
 @pytest.mark.parametrize("window", [(-1, -1), (64, 64)])
-def test_no_sentinel_survives_in_a_reused_destination(window):
+@pytest.mark.parametrize("lengths", [LENGTHS, ALL_FAST, ALL_REST])
+def test_no_sentinel_survives_in_a_reused_destination(window, lengths):
     """Poisoned gradient buffers, reused: every valid element must be rewritten.
 
     A fresh allocation often reads as zero, which can hide a missing store, so
-    the same buffers are refilled with three patterns and reused.
+    the same buffers are refilled with three patterns and reused. Passing this
+    shows the elements were written, not that they were written correctly; the
+    float64 gates above are what check the values.
     """
-    lengths = LENGTHS
     inputs = _inputs(lengths)
-    q = inputs[0]
-    grads = [torch.empty_like(q) for _ in GRADS]
+    grads = [torch.empty_like(inputs[0]) for _ in GRADS]
     reference = None
     for sentinel in SENTINELS:
         for grad in grads:
@@ -417,26 +496,56 @@ def test_no_sentinel_survives_in_a_reused_destination(window):
         for name in GRADS:
             value = result[name]
             assert torch.isfinite(value).all(), f"{name} kept a NaN sentinel"
-            if sentinel == 7.5:
-                continue
-            assert not (value.float() == sentinel).all(-1).any(), (
-                f"{name} kept a whole row of the {sentinel} sentinel"
-            )
+            if sentinel != 7.5:
+                assert not (value.float() == sentinel).any(), (
+                    f"{name} kept the {sentinel} sentinel")
         if reference is None:
             reference = {n: result[n].clone() for n in GRADS}
         else:
             for name in GRADS:
-                delta = (reference[name].float() - result[name].float()).abs().max()
+                delta = (reference[name].double() - result[name].double()).abs().max()
                 assert delta < 1e-2, (name, sentinel, delta.item())
 
 
-def test_alternating_short_and_long_batches_do_not_share_state():
-    """The two arms share scratch space, so alternating shapes must still agree."""
-    short, long = [60, 70, 80], [300, 400, 500]
-    expected = {name: _run(lengths) for name, lengths in (("s", short), ("l", long))}
+@pytest.mark.parametrize("first,second", [
+    (ALL_FAST, ALL_REST),     # one arm idle, then the other
+    (ALL_REST, ALL_FAST),
+    (ALL_FAST, BOTH_ARMS),
+    ([60, 70, 80], [300, 400, 500]),   # both in the rest arm, different shapes
+])
+def test_alternating_batches_do_not_share_state(first, second):
+    """The two arms reuse scratch and the scheduler semaphore between launches.
+
+    Alternating an all-fast batch with an all-rest one leaves each arm idle in
+    turn, which is where a missed semaphore reset or stale scratch shows up.
+    """
+    expected = {0: _run(first), 1: _run(second)}
     for _ in range(3):
-        for name, lengths in (("s", short), ("l", long)):
+        for index, lengths in enumerate((first, second)):
             again = _run(lengths)
             for key, value in again.items():
-                delta = (expected[name][key].float() - value.float()).abs().max()
-                assert delta < 1e-2, (name, key, delta.item())
+                delta = (expected[index][key].double() - value.double()).abs().max()
+                assert delta < 1e-2, (lengths, key, delta.item())
+
+
+def test_results_do_not_depend_on_being_profiled_or_synchronized():
+    """Queue several calls with different shapes before synchronizing once.
+
+    Every other gate synchronizes after each call, and the path gates run under
+    the profiler; both can hide a race. Here the launches are left to overlap.
+    """
+    cases = [ALL_FAST, ALL_REST, BOTH_ARMS, LENGTHS]
+    expected = [_run(lengths) for lengths in cases]
+    pending = []
+    for lengths in cases:
+        q, k, v, do = _inputs(lengths)
+        cu = _cu(lengths)
+        out, lse = _forward(q, k, v, cu, lengths)
+        grads = [torch.empty_like(q) for _ in GRADS]
+        _backward(do, q, k, v, out, lse, cu, lengths, grads)
+        pending.append(dict(zip(("out", "lse", *GRADS), (out, lse, *grads))))
+    torch.cuda.synchronize()
+    for lengths, want, got in zip(cases, expected, pending):
+        for key in want:
+            delta = (want[key].double() - got[key].double()).abs().max()
+            assert delta < 1e-2, (lengths, key, delta.item())

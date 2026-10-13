@@ -853,24 +853,33 @@ shape" check cannot. Most gates need no tolerance: they compare bits, exact non-
 or which kernel ran. Run on 2026-10-13 against two trees — the merge-base `0251105a2f` as
 pristine upstream, and HEAD with `FLASH_ATTENTION_SHORT_SEQ_TILES=TRUE` as the shipped config.
 
-**The dispatch is proved, not assumed.** Every fast path is gated on Q and K sharing one
+**The dispatch is pinned down, not assumed.** Every fast path is gated on Q and K sharing one
 `cu_seqlens` *pointer* with no `seqused` (`flash_bwd_launch_template.h:64`, `flash.h:173`), so a
-caller passing two equal-valued tensors silently gets upstream's kernel. Each gate reads the
-launched kernel names back from the profiler and asserts the tile shape, so no test can pass by
-having quietly measured upstream.
+caller passing two equal-valued tensors silently gets upstream's kernel. The path gates read the
+launched kernel names back from the profiler and assert the tile shape. They establish which
+specialization ran for a given call shape — *not* which sequences or tiles it processed, and the
+value gates do not re-check their own dispatch. Both backward arms launch for every batch, even
+when a length bucket is empty, so kernel names cannot show arm membership at all.
 
 | gate | property | tolerance |
 |---|---|---|
-| path proof | forward 192×80; local 64×64 inside the `use_small_local_fwd` window and 192×128 outside it; backward 32×256 + 128×128 with the partition kernel; a cloned `cu_seqlens_k` falls back to 128×128 | none |
-| cross-sequence isolation | change or NaN one packed sequence: every other sequence's `out`, `lse`, dK, dV stays bit-identical | none |
+| path proof | forward 192×80; local 64×64 inside the `use_small_local_fwd` window and 192×128 outside it; both backward arms (32×256 + 128×128) plus the partition kernel on every batch; a cloned `cu_seqlens_k` falls back to 128×128 | none |
+| cross-sequence isolation | perturb one packed sequence's Q/K/V, or only its `dout`: every other sequence's `out`, `lse`, dK, dV stays bit-identical. Victims in both arms, and in all-fast, all-rest and mixed batches | none |
 | non-finite direction | a NaN never reaches a *later* sequence (every victim, 11 cases) | none |
-| repeatability | 5 identical calls: `out`, `lse`, dK, dV bit-identical; dQ spread recorded | none / measured |
-| poisoned destinations | gradient buffers refilled with NaN, −1e4 and 7.5 and reused: no sentinel survives, results unchanged | 1e-2 |
-| shared scratch | alternating short and long batches agree with their own single-shape runs | 1e-2 |
-| values | `out`, `lse`, dQ, dK, dV against a per-sequence float64 reference, 5 windows, lengths across the 128/256 split | 1e-2 / 2e-2 |
+| zero window | at window (0,0) each query attends only to itself, so `out == V` and dV == `dout` **exactly**, with dQ, dK ≈ 0 | none / 1e-5 |
+| repeatability | 5 identical calls, every pair compared: `out`, `lse`, dK, dV bit-identical, in all-fast and all-rest batches; dQ bounded | none / 1e-2 |
+| poisoned destinations | gradient buffers refilled with NaN, −1e4 and 7.5 and reused: no sentinel survives anywhere, results unchanged | 1e-2 |
+| shared scratch | all-fast and all-rest batches alternated, so each arm goes idle in turn, and each must match its own standalone result | 1e-2 |
+| unsynchronized | four batches queued back to back with one synchronize at the end, outside the profiler | 1e-2 |
+| values | `out`, `lse`, dQ, dK, dV against a per-sequence float64 reference built from inputs snapshotted **before** the call, which also checks the call did not modify its own inputs. 5 windows × 3 seeds, and 8 length sets across the 128/256 split and the 80/192 tile edges | 1e-2 / 2e-2 |
+
+The value bounds are 3.5–3.7× the error the kernels actually show, so they are acceptance
+budgets that catch a blow-up, not evidence of equivalence. The tight comparison is the next
+table.
 
 **Fork against upstream.** The claim is "faster, not different", so the load-bearing comparison
-is relative. Max error against the same float64 reference on the 12-length ragged batch:
+is relative: `fork ≤ upstream × 1.25 + one bf16 ulp`. Max error against the same float64
+reference on the 12-length ragged batch:
 
 | tensor | upstream | fork |
 |---|---:|---:|
@@ -889,25 +898,61 @@ properties are worth naming.
   cases; in the other 2 the fork reaches **fewer** sequences, its KV tile being narrower. It
   never travels forward, which is what the gate enforces.
 * **dQ is steadier than upstream's.** Run-to-run spread on identical inputs: upstream 4.9e−4,
-  fork 3.1e−5, because direct stores replace most of the atomic accumulation. The forward, dK
-  and dV are bit-identical across runs in both.
+  fork 1e−6, because direct stores replace most of the atomic accumulation. The forward, dK and
+  dV are bit-identical across runs in both.
 
-**The suite is checked against deliberate bugs.** Three one-line mutants of HEAD:
+**The suite is checked against deliberate bugs.** Five one-line mutants of HEAD, each rebuilt
+and run through the whole suite:
 
 | mutant | injected defect | caught by |
 |---|---|---:|
-| `m_dqoff` | direct dQ store one row too far | 7 gate groups, 20 cases |
-| `m_dqskip` | one dQ store in eight dropped | 6 groups, 11 cases |
-| `m_floor` | scheduler drops each partial tail tile | 8 groups, 16 cases |
+| `m_dqoff` | direct dQ store one row too far | 11 gate groups, 53 cases |
+| `m_floor` | scheduler drops each partial tail tile | 10 groups, 47 cases |
+| `m_dqskip` | one dQ store in eight dropped | 8 groups, 43 cases |
+| `m_dqacc` | direct dQ accumulates instead of assigning | 8 groups, 42 cases |
+| `m_part` | length 256 moved out of the direct-dQ bucket | 8 groups, 34 cases |
 
-All three still pass every path gate, so the mutated code did run: the failures are detections,
-not a dead branch. On pristine upstream the suite fails **only** the 6 path-proof cases and
-passes all 29 behaviour gates, so the path gates do detect the fork's paths and the behaviour
-gates are not shaped around it.
+All five still pass every path gate, so the mutated code did run: the failures are detections,
+not a dead branch. Counting gate groups overstates independence, though — they share fixtures
+and one float64 oracle, so the failures are correlated rather than five separate signals.
 
-Not covered here: FP16 (disabled in this build), causal, GQA, softcap, split and paged KV, head
-dimensions other than 64, `dv != d`, and deterministic mode, which disables both fast paths by
-design. The upstream suite covers those; see Status below.
+`m_part` is worth a note. Moving one length out of the bucket looks like a dispatch change,
+since both arms compute attention correctly, but it produces NaN gradients. The partition
+threshold is coupled to the preprocess pass, which skips clearing `dq_accum` for sequences
+short enough that the fast arm will write dQ directly; route such a sequence to the accumulating
+arm and it sums into uncleared memory. The boundary is load-bearing, not a tuning knob.
+
+On pristine upstream the suite fails **only** the 13 path-proof cases and passes all 69
+behaviour gates, so the path gates do detect the fork's paths and the behaviour gates are not
+shaped around it.
+
+**Known gaps**, from an adversarial review of the suite by GPT-6 Astra:
+
+* **No tile-visit accounting.** That every sequence lands in exactly one arm, and every required
+  tile is visited exactly once, is not established. Duplicate work that writes identical values
+  would pass every gate here. This needs a debug build that counts visits per (arm, sequence,
+  head, tile) against a host enumeration derived independently of the device's own indexing.
+* **No scheduler workload sweep** across the worker-CTA count (tiles below, at and above it, and
+  several rounds), and no CUDA-graph replay or concurrent streams. The unsynchronized gate is a
+  weaker substitute.
+* **Layout and parameter coverage is thin**: contiguous inputs only, one softmax scale, exact
+  `max_seqlen` rather than a loose upper bound, and no memory-safety diagnostics
+  (`compute-sanitizer`) on the fast paths.
+* **One seed family and random inputs.** Three seeds, no structured cases (uniform or peaked
+  logits, cancellation), and comparison by maximum error only, which hides a new error at one
+  token beneath an unchanged maximum elsewhere.
+* **NaN containment is one-sided**: the gate bounds the direction, not the number of preceding
+  sequences reached, and omits `lse`. The subset check against upstream covers only its 21 fixed
+  cases, and a build that wrongly *suppressed* propagation would also satisfy it.
+
+Not covered at all: FP16 (disabled in this build), causal, GQA, softcap, split and paged KV,
+head dimensions other than 64, `dv != d`, and deterministic mode, which disables both fast paths
+by design. The upstream suite covers those; see Status below.
+
+So the defensible claim is narrow: **on the enumerated GH200 configurations and inputs, the fork
+meets the stated float64 error budgets and matches or improves upstream's measured repeatability
+and non-finite behaviour.** It is not a proof of isolation or of scheduler correctness, and where
+upstream has the same property, matching it shows compatibility rather than correctness.
 
 ## Status and limitations
 
